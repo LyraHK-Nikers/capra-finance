@@ -2406,6 +2406,12 @@ st.markdown(
         transition: all 0.15s ease;
         box-shadow: 0 1px 3px rgba(139, 92, 246, 0.3);
     }
+    /* Keep button labels on a single line (no mid-word wrapping in narrow columns). */
+    .stButton button p, .stButton button div, .stButton button {
+        white-space: nowrap !important;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
     .stButton button:hover, .stDownloadButton button:hover, .stFormSubmitButton button:hover {
         transform: translateY(-1px);
         box-shadow: 0 4px 12px rgba(139, 92, 246, 0.4);
@@ -2724,11 +2730,13 @@ with st.sidebar:
         universe.setdefault(t, t)
 
     # ---- Quick bulk-select from the loaded preset universe ------------------
-    btn_cols = st.columns(4)
-    btn_cols[0].button("Top 20", use_container_width=True, on_click=_set_watchlist, args=(universe_keys[:20],), help="From presets")
-    btn_cols[1].button("Top 50", use_container_width=True, on_click=_set_watchlist, args=(universe_keys[:50],))
-    btn_cols[2].button("Top 100", use_container_width=True, on_click=_set_watchlist, args=(universe_keys[:100],), help="~10–15s load")
-    btn_cols[3].button("Clear", use_container_width=True, on_click=_set_watchlist, args=([],), key="clear_watchlist")
+    st.caption("Quick pick from presets:")
+    _r1 = st.columns(2)
+    _r1[0].button("Top 20", use_container_width=True, on_click=_set_watchlist, args=(universe_keys[:20],))
+    _r1[1].button("Top 50", use_container_width=True, on_click=_set_watchlist, args=(universe_keys[:50],))
+    _r2 = st.columns(2)
+    _r2[0].button("Top 100", use_container_width=True, on_click=_set_watchlist, args=(universe_keys[:100],), help="~10–15s load")
+    _r2[1].button("Clear", use_container_width=True, on_click=_set_watchlist, args=([],), key="clear_watchlist")
 
     if len(chosen_tickers) > 100:
         st.warning(
