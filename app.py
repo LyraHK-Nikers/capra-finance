@@ -498,8 +498,8 @@ class StockMetrics:
 # but for the major exchanges we cover (US/HK/India/Europe/Japan/Korea/AU) the
 # field is already converted to USD by yfinance.
 CAP_BUCKETS = [
-    ("Mega Cap",   200e9, float("inf"), "#a78bfa"),
-    ("Large Cap",   10e9,        200e9, "#6366f1"),
+    ("Mega Cap",   200e9, float("inf"), "#ff9a5c"),
+    ("Large Cap",   10e9,        200e9, "#f7931e"),
     ("Mid Cap",      2e9,         10e9, "#3b82f6"),
     ("Small Cap",  500e6,          2e9, "#06b6d4"),
     ("Micro Cap",   50e6,        500e6, "#f59e0b"),
@@ -863,7 +863,7 @@ def show_company_detail(ticker: str, display_name: str = "") -> None:
 
     st.markdown(
         f"<h3 style='margin:0 0 4px 0;color:#f3f4f6;'>{ticker} · "
-        f"<span style='color:#a78bfa;'>{display_name}</span></h3>",
+        f"<span style='color:#ff9a5c;'>{display_name}</span></h3>",
         unsafe_allow_html=True,
     )
     sector = info.get("sector", "—")
@@ -896,8 +896,8 @@ def show_company_detail(ticker: str, display_name: str = "") -> None:
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=series.index, y=series.values, mode="lines",
-                line=dict(color="#a78bfa", width=2),
-                fill="tozeroy", fillcolor="rgba(139,92,246,0.08)",
+                line=dict(color="#ff9a5c", width=2),
+                fill="tozeroy", fillcolor="rgba(255,107,53,0.08)",
                 name=ticker,
             ))
             fig.update_layout(
@@ -977,7 +977,7 @@ def show_company_detail(ticker: str, display_name: str = "") -> None:
             upside = (target / price - 1) * 100
             st.markdown(
                 f"<div style='margin-top:14px;padding:12px;border-radius:8px;"
-                f"background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.25);'>"
+                f"background:rgba(255,107,53,0.08);border:1px solid rgba(255,107,53,0.25);'>"
                 f"<b>Analyst consensus target:</b> {target:,.2f} "
                 f"<span style='color:{'#10b981' if upside >= 0 else '#ef4444'};'>"
                 f"({upside:+.1f}% upside)</span> · "
@@ -1081,11 +1081,11 @@ def _render_event_card(event: dict) -> None:
         '<div style="flex:1;min-width:0;">'
         f'<div style="font-weight:600;font-size:0.95rem;color:#f3f4f6;line-height:1.3;letter-spacing:-0.01em;">{title}</div>'
         '<div style="color:#9ca3af;font-size:0.7rem;margin-top:6px;">'
-        f'{days_to_end} · <span style="color:#a78bfa;">${vol24h/1000:,.0f}k</span> 24h · ${vol_total/1e6:.1f}M total'
+        f'{days_to_end} · <span style="color:#ff9a5c;">${vol24h/1000:,.0f}k</span> 24h · ${vol_total/1e6:.1f}M total'
         '</div></div></div>'
         f'{inner_markets_html}'
         '<div style="margin-top:auto;padding-top:10px;font-size:0.72rem;color:#9ca3af;">'
-        f'<a href="{poly_url}" target="_blank" style="color:#a78bfa;text-decoration:none;font-weight:500;">Open on Polymarket →</a>{extra_txt}'
+        f'<a href="{poly_url}" target="_blank" style="color:#ff9a5c;text-decoration:none;font-weight:500;">Open on Polymarket →</a>{extra_txt}'
         '</div></div>'
     )
     st.markdown(card_html, unsafe_allow_html=True)
@@ -1711,7 +1711,7 @@ A narrow range = robust thesis; a wild range = fragile.
             gauge={
                 "axis": {"range": [0, axis_max], "tickcolor": "#64748b",
                          "tickfont": {"color": "#94a3b8", "size": 10}},
-                "bar": {"color": "#a78bfa", "thickness": 0.3},
+                "bar": {"color": "#ff9a5c", "thickness": 0.3},
                 "bgcolor": "rgba(0,0,0,0)",
                 "borderwidth": 0,
                 "steps": [
@@ -1766,7 +1766,7 @@ A narrow range = robust thesis; a wild range = fragile.
         verdict_color = "#10b981"
     else:
         verdict_txt = "Market expectations roughly match recent growth — fairly priced"
-        verdict_color = "#a78bfa"
+        verdict_color = "#ff9a5c"
 
     rc = st.columns(3)
     rc[0].metric("Market-implied 5-yr growth", implied_str, help=implied_note)
@@ -1806,9 +1806,9 @@ A narrow range = robust thesis; a wild range = fragile.
         pv_vals = [r["fcf"] / (1 + a["wacc"]) ** r["t"] for r in pr]
         fcf_fig = go.Figure()
         fcf_fig.add_trace(go.Bar(x=years, y=fcf_vals, name="Free cash flow",
-                                 marker_color="#6366f1"))
+                                 marker_color="#f7931e"))
         fcf_fig.add_trace(go.Bar(x=years, y=pv_vals, name="PV of FCF",
-                                 marker_color="#a78bfa"))
+                                 marker_color="#ff9a5c"))
         fcf_fig.update_layout(
             barmode="group", height=300, margin=dict(t=10, l=10, r=10, b=10),
             template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -1865,9 +1865,9 @@ A narrow range = robust thesis; a wild range = fragile.
             orientation="v", measure=wf_measure, x=wf_x, y=wf_y,
             text=wf_text, textposition="outside", textfont=dict(size=11, color="#cbd5e1"),
             connector={"line": {"color": "rgba(255,255,255,0.18)"}},
-            increasing={"marker": {"color": "#6366f1"}},
+            increasing={"marker": {"color": "#f7931e"}},
             decreasing={"marker": {"color": "#ef4444"}},
-            totals={"marker": {"color": "#a78bfa"}},
+            totals={"marker": {"color": "#ff9a5c"}},
         ))
         wf.update_layout(
             height=380, margin=dict(t=30, l=10, r=10, b=10),
@@ -2104,7 +2104,7 @@ def render_prediction_markets() -> None:
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
           <h2 style="margin:0;">🎯 Prediction Markets</h2>
           <span style="color:#9ca3af;font-size:0.8rem;">
-            Live odds from <a href="https://polymarket.com" target="_blank" style="color:#a78bfa;text-decoration:none;">polymarket.com</a>
+            Live odds from <a href="https://polymarket.com" target="_blank" style="color:#ff9a5c;text-decoration:none;">polymarket.com</a>
             · Gamma API · 60s cache
           </span>
         </div>
@@ -2322,64 +2322,76 @@ if _LOGO_PATH:
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
     html, body, [class*="css"], .stApp, .stMarkdown, button, input, select, textarea {
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
         font-feature-settings: 'cv02','cv03','cv04','cv11';
     }
 
+    /* Pure-black tech-ops canvas with a faint tactical grid overlay. */
     .stApp {
-        background: radial-gradient(circle at 15% 0%, #1a1428 0%, #0a0a0f 50%) fixed;
+        background:
+            linear-gradient(rgba(255,107,53,0.025) 1px, transparent 1px) 0 0 / 100% 44px,
+            linear-gradient(90deg, rgba(255,107,53,0.025) 1px, transparent 1px) 0 0 / 44px 100%,
+            #000000 fixed;
     }
 
     /* Main content padding */
     .main .block-container { padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1400px; }
 
-    /* Gradient title */
+    /* Monospace for technical labels — the terminal / tech-ops signature. */
+    [data-testid="stMetricLabel"], .gt-pill, [data-testid="stCaptionContainer"],
+    .stCaption, [data-testid="stMetricDelta"] {
+        font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace !important;
+    }
+
+    /* Title — bold warm-orange gradient, wide tactical tracking. */
     h1 {
-        background: linear-gradient(135deg, #c4b5fd 0%, #8b5cf6 50%, #6366f1 100%);
+        background: linear-gradient(135deg, #ffc9a3 0%, #ff6b35 50%, #f7931e 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         background-clip: text;
-        font-weight: 700 !important;
-        letter-spacing: -0.025em;
+        font-weight: 800 !important;
+        letter-spacing: -0.01em;
     }
-    h2, h3 { color: #f3f4f6 !important; font-weight: 600 !important; letter-spacing: -0.015em; }
+    h2, h3 { color: #f3f4f6 !important; font-weight: 700 !important; letter-spacing: -0.01em; }
 
     /* Top page-selector radio — pill style */
     div[role="radiogroup"] { gap: 0.5rem; }
     div[role="radiogroup"] label {
-        background: rgba(139, 92, 246, 0.08);
-        border: 1px solid rgba(139, 92, 246, 0.2);
+        background: rgba(255, 107, 53, 0.08);
+        border: 1px solid rgba(255, 107, 53, 0.2);
         padding: 0.5rem 1rem;
         border-radius: 999px;
         transition: all 0.15s ease;
         cursor: pointer;
     }
     div[role="radiogroup"] label:hover {
-        background: rgba(139, 92, 246, 0.18);
-        border-color: rgba(139, 92, 246, 0.4);
+        background: rgba(255, 107, 53, 0.18);
+        border-color: rgba(255, 107, 53, 0.4);
     }
     div[role="radiogroup"] label[data-checked="true"] {
-        background: linear-gradient(135deg, #8b5cf6, #6366f1);
-        border-color: #8b5cf6;
+        background: linear-gradient(135deg, #ff6b35, #f7931e);
+        border-color: #ff6b35;
         color: white !important;
     }
 
-    /* Metric cards — subtle glow */
+    /* Metric cards — sharp tactical panels */
     [data-testid="stMetric"] {
-        background: rgba(255, 255, 255, 0.02);
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.015);
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        border-left: 2px solid rgba(255, 107, 53, 0.55);
+        border-radius: 4px;
         padding: 1rem 1.25rem;
         transition: all 0.2s ease;
     }
     [data-testid="stMetric"]:hover {
-        border-color: rgba(139, 92, 246, 0.3);
-        background: rgba(139, 92, 246, 0.04);
+        border-color: rgba(255, 107, 53, 0.45);
+        border-left-color: #ff6b35;
+        background: rgba(255, 107, 53, 0.05);
     }
-    [data-testid="stMetricLabel"] { color: #9ca3af !important; font-size: 0.75rem !important; font-weight: 500 !important; text-transform: uppercase; letter-spacing: 0.05em; }
+    [data-testid="stMetricLabel"] { color: #9ca3af !important; font-size: 0.72rem !important; font-weight: 500 !important; text-transform: uppercase; letter-spacing: 0.08em; }
     [data-testid="stMetricValue"] { color: #f3f4f6 !important; font-weight: 700 !important; font-size: 1.6rem !important; }
 
     /* Inputs */
@@ -2391,20 +2403,20 @@ st.markdown(
         color: #f3f4f6 !important;
     }
     .stTextInput input:focus, .stNumberInput input:focus {
-        border-color: #8b5cf6 !important;
-        box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15) !important;
+        border-color: #ff6b35 !important;
+        box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.15) !important;
     }
 
     /* Buttons */
     .stButton button, .stDownloadButton button, .stFormSubmitButton button {
-        background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+        background: linear-gradient(135deg, #ff6b35 0%, #f7931e 100%);
         border: none;
         border-radius: 8px;
         padding: 0.5rem 1.1rem;
         font-weight: 500;
         color: white;
         transition: all 0.15s ease;
-        box-shadow: 0 1px 3px rgba(139, 92, 246, 0.3);
+        box-shadow: 0 1px 3px rgba(255, 107, 53, 0.3);
     }
     /* Keep button labels on a single line (no mid-word wrapping in narrow columns). */
     .stButton button p, .stButton button div, .stButton button {
@@ -2414,7 +2426,7 @@ st.markdown(
     }
     .stButton button:hover, .stDownloadButton button:hover, .stFormSubmitButton button:hover {
         transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(139, 92, 246, 0.4);
+        box-shadow: 0 4px 12px rgba(255, 107, 53, 0.4);
     }
 
     /* Sidebar */
@@ -2449,8 +2461,8 @@ st.markdown(
     /* Scrollbars */
     ::-webkit-scrollbar { width: 10px; height: 10px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.3); border-radius: 5px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(139, 92, 246, 0.5); }
+    ::-webkit-scrollbar-thumb { background: rgba(255, 107, 53, 0.3); border-radius: 5px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255, 107, 53, 0.5); }
 
     /* Alerts / info / warning boxes */
     [data-testid="stAlertContainer"] {
@@ -2458,29 +2470,40 @@ st.markdown(
         backdrop-filter: blur(10px);
     }
 
-    /* Custom card class used by our HTML tiles */
+    /* Custom card class used by our HTML tiles — sharp tactical panel */
     .gt-card {
-        background: linear-gradient(135deg, rgba(255,255,255,0.03) 0%, rgba(139,92,246,0.04) 100%);
+        background: linear-gradient(135deg, rgba(255,255,255,0.02) 0%, rgba(255,107,53,0.035) 100%);
         border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 12px;
+        border-radius: 4px;
         padding: 14px 16px;
-        transition: all 0.2s ease;
+        transition: all 0.18s ease;
         height: 100%;
     }
     .gt-card:hover {
-        border-color: rgba(139, 92, 246, 0.35);
+        border-color: rgba(255, 107, 53, 0.45);
         transform: translateY(-2px);
-        box-shadow: 0 8px 24px rgba(139, 92, 246, 0.15);
+        box-shadow: 0 6px 22px rgba(255, 107, 53, 0.18);
     }
 
+    /* Pills — squared terminal tags, monospace */
     .gt-pill {
         display: inline-block;
-        padding: 2px 8px;
-        border-radius: 999px;
-        font-size: 0.68rem;
+        padding: 2px 7px;
+        border-radius: 3px;
+        font-size: 0.64rem;
         font-weight: 600;
-        letter-spacing: 0.02em;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
     }
+
+    /* Pill-style page-selector tabs and bulk buttons stay rounded for contrast,
+       but inputs/expanders square up to match the tactical grid. */
+    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div,
+    .stMultiSelect div[data-baseweb="select"] > div { border-radius: 4px !important; }
+    .streamlit-expanderHeader, [data-testid="stExpander"] summary { border-radius: 4px !important; }
+    [data-testid="stAlertContainer"] { border-radius: 4px !important; }
+    .stButton button, .stFormSubmitButton button { border-radius: 4px !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2506,27 +2529,27 @@ if not st.session_state.get("_intro_done"):
         "flex-direction:column;align-items:center;justify-content:center;overflow:hidden;"
         "font-family:'Inter',-apple-system,sans-serif;animation:introOut .7s ease 4.8s forwards;}"
         "#capra-intro .vignette{position:absolute;inset:0;background:"
-        "radial-gradient(circle at 50% 44%,rgba(99,102,241,.12),rgba(0,0,0,0) 55%),"
+        "radial-gradient(circle at 50% 44%,rgba(255,107,53,.12),rgba(0,0,0,0) 55%),"
         "radial-gradient(circle at 50% 50%,rgba(0,0,0,0) 38%,#000 100%);pointer-events:none;}"
         "#capra-intro .logo{width:138px;height:138px;border-radius:26px;background:#fff;opacity:0;"
         "transform:scale(.7);animation:logoIn 1.6s cubic-bezier(.2,.7,.2,1) .3s forwards,"
         "logoGlow 2.4s ease 1.4s forwards;}"
         "#capra-intro .line{width:0;height:1px;margin-top:32px;"
-        "background:linear-gradient(90deg,transparent,#8b5cf6,transparent);"
+        "background:linear-gradient(90deg,transparent,#ff6b35,transparent);"
         "animation:lineGrow 1.4s ease 1.2s forwards;}"
         "#capra-intro .word{margin-top:28px;font-weight:800;font-size:clamp(2.4rem,7vw,4.8rem);"
         "color:#fff;letter-spacing:.06em;text-align:center;line-height:1;opacity:0;"
         "animation:wordIn 1.4s ease 1.9s forwards;}"
         "#capra-intro .word .sub{display:block;font-size:.24em;font-weight:600;letter-spacing:.55em;"
-        "color:#a78bfa;margin-top:14px;opacity:0;animation:wordIn 1.2s ease 2.6s forwards;}"
+        "color:#ff9a5c;margin-top:14px;opacity:0;animation:wordIn 1.2s ease 2.6s forwards;}"
         "#capra-intro .tag{margin-top:26px;font-size:.78rem;font-weight:500;letter-spacing:.5em;"
         "color:#64748b;text-transform:uppercase;opacity:0;animation:wordIn 1.2s ease 3.2s forwards;}"
         "#capra-intro .timebar{position:absolute;bottom:0;left:0;height:2px;width:0;"
-        "background:linear-gradient(90deg,#6366f1,#a78bfa);box-shadow:0 0 14px #8b5cf6;"
+        "background:linear-gradient(90deg,#f7931e,#ff9a5c);box-shadow:0 0 14px #ff6b35;"
         "animation:timeFill 4.8s linear .2s forwards;}"
         "@keyframes logoIn{to{opacity:1;transform:scale(1);}}"
-        "@keyframes logoGlow{0%{box-shadow:0 0 0 rgba(139,92,246,0);}"
-        "50%{box-shadow:0 0 72px rgba(139,92,246,.55);}100%{box-shadow:0 0 38px rgba(139,92,246,.30);}}"
+        "@keyframes logoGlow{0%{box-shadow:0 0 0 rgba(255,107,53,0);}"
+        "50%{box-shadow:0 0 72px rgba(255,107,53,.55);}100%{box-shadow:0 0 38px rgba(255,107,53,.30);}}"
         "@keyframes lineGrow{to{width:min(440px,72vw);}}"
         "@keyframes wordIn{to{opacity:1;}}"
         "@keyframes timeFill{to{width:100%;}}"
@@ -2554,7 +2577,7 @@ if _LOGO_DATA_URI:
     _logo_inline = (
         f'<img src="{_LOGO_DATA_URI}" '
         f'style="height:52px;width:52px;border-radius:12px;background:#fff;'
-        f'object-fit:cover;box-shadow:0 4px 18px rgba(139,92,246,0.25);">'
+        f'object-fit:cover;box-shadow:0 4px 18px rgba(255,107,53,0.25);">'
     )
 
 st.markdown(
@@ -3050,7 +3073,7 @@ def live_quote_tiles() -> None:
                     f'<div title="{safe_name}" style="color:#cbd5e1;font-size:0.74rem;margin:4px 0 10px 0;line-height:1.35;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;min-height:2.05em;">{safe_name}</div>'
                     f'<div style="font-size:1.55rem;font-weight:700;color:#f3f4f6;letter-spacing:-0.02em;line-height:1.1;">{live_price:,.2f}</div>'
                     f'<div style="color:{color};font-size:0.85rem;font-weight:600;margin-top:3px;">{_fmt_pct(m.pct_change_1d)} today</div>'
-                    '<div style="margin-top:8px;padding:6px 8px;border-radius:8px;background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.18);">'
+                    '<div style="margin-top:8px;padding:6px 8px;border-radius:8px;background:rgba(255,107,53,0.08);border:1px solid rgba(255,107,53,0.18);">'
                     f'<span style="font-size:0.64rem;color:#94a3b8;text-transform:uppercase;letter-spacing:0.04em;">{sel_period} change</span><br>'
                     f'<span style="font-size:1.1rem;font-weight:700;color:{period_color};">{period_str}</span>'
                     '</div>'
