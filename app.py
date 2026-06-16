@@ -1642,6 +1642,36 @@ A narrow range = robust thesis; a wild range = fragile.
 
     cur = base["currency"]
 
+    # --- Live quote header (current price, today's move, trend) ----------
+    _vhist = fetch_history((chosen,), period="6mo")
+    pct_today = float("nan")
+    spark_html = ""
+    if not _vhist.empty and chosen in _vhist.columns:
+        _vs = _vhist[chosen].dropna()
+        if len(_vs) >= 2:
+            pct_today = float(_vs.iloc[-1] / _vs.iloc[-2] - 1)
+        _spark_win = _vs[_vs.index >= _vs.index[-1] - pd.Timedelta(days=92)]
+        spark_html = _sparkline_svg(_spark_win.tolist(), width=320, height=44)
+    _tcolor = _color(pct_today)
+    _safe_name = (base["name"] or chosen).replace("<", "&lt;").replace(">", "&gt;")
+    st.markdown(
+        '<div class="gt-card" style="margin-bottom:6px;">'
+        '<div style="display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap;">'
+        '<div>'
+        f'<div style="font-weight:700;font-size:1.05rem;color:#f3f4f6;letter-spacing:-0.01em;">{chosen}'
+        f'<span style="color:#9ca3af;font-size:0.8rem;font-weight:500;margin-left:8px;">{_safe_name}</span></div>'
+        f'<div style="font-size:2.1rem;font-weight:800;color:#f3f4f6;line-height:1.1;margin-top:4px;">'
+        f'{base["price"]:,.2f}<span style="font-size:0.9rem;color:#64748b;font-weight:500;margin-left:8px;">{cur}</span></div>'
+        f'<div style="color:{_tcolor};font-size:0.9rem;font-weight:600;margin-top:2px;">{_fmt_pct(pct_today)} today</div>'
+        '</div>'
+        '<div style="flex:1;min-width:240px;max-width:360px;">'
+        '<div style="font-size:0.62rem;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px;font-family:\'JetBrains Mono\',monospace;">3M Trend</div>'
+        f'{spark_html}'
+        '</div>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+
     # --- Assumptions (editable) -----------------------------------------
     with st.expander("⚙️ Assumptions — tune the model", expanded=False):
         st.caption("WACC ≈ the yearly return investors demand (~7–10%). "
@@ -2322,7 +2352,7 @@ if _LOGO_PATH:
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
     html, body, [class*="css"], .stApp, .stMarkdown, button, input, select, textarea {
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
@@ -2527,7 +2557,7 @@ if not st.session_state.get("_intro_done"):
         ".stApp{background:#000!important;}"
         "#capra-intro{position:fixed;inset:0;z-index:2147483000;background:#000;display:flex;"
         "flex-direction:column;align-items:center;justify-content:center;overflow:hidden;"
-        "font-family:'Inter',-apple-system,sans-serif;animation:introOut .7s ease 4.8s forwards;}"
+        "font-family:'Big Shoulders Display','Inter',sans-serif;animation:introOut .7s ease 4.8s forwards;}"
         "#capra-intro .vignette{position:absolute;inset:0;background:"
         "radial-gradient(circle at 50% 44%,rgba(255,107,53,.12),rgba(0,0,0,0) 55%),"
         "radial-gradient(circle at 50% 50%,rgba(0,0,0,0) 38%,#000 100%);pointer-events:none;}"
@@ -2537,13 +2567,14 @@ if not st.session_state.get("_intro_done"):
         "#capra-intro .line{width:0;height:1px;margin-top:32px;"
         "background:linear-gradient(90deg,transparent,#ff6b35,transparent);"
         "animation:lineGrow 1.4s ease 1.2s forwards;}"
-        "#capra-intro .word{margin-top:28px;font-weight:800;font-size:clamp(2.4rem,7vw,4.8rem);"
-        "color:#fff;letter-spacing:.06em;text-align:center;line-height:1;opacity:0;"
+        "#capra-intro .word{margin-top:28px;font-weight:900;font-size:clamp(3rem,9vw,6.4rem);"
+        "color:#fff;letter-spacing:.04em;text-transform:uppercase;text-align:center;line-height:.92;opacity:0;"
         "animation:wordIn 1.4s ease 1.9s forwards;}"
-        "#capra-intro .word .sub{display:block;font-size:.24em;font-weight:600;letter-spacing:.55em;"
-        "color:#ff9a5c;margin-top:14px;opacity:0;animation:wordIn 1.2s ease 2.6s forwards;}"
-        "#capra-intro .tag{margin-top:26px;font-size:.78rem;font-weight:500;letter-spacing:.5em;"
-        "color:#64748b;text-transform:uppercase;opacity:0;animation:wordIn 1.2s ease 3.2s forwards;}"
+        "#capra-intro .word .sub{display:block;font-size:.26em;font-weight:700;letter-spacing:.5em;"
+        "color:#ff9a5c;margin-top:10px;opacity:0;animation:wordIn 1.2s ease 2.6s forwards;}"
+        "#capra-intro .tag{margin-top:26px;font-size:.72rem;font-weight:500;letter-spacing:.42em;"
+        "font-family:'JetBrains Mono',monospace;color:#64748b;text-transform:uppercase;opacity:0;"
+        "animation:wordIn 1.2s ease 3.2s forwards;}"
         "#capra-intro .timebar{position:absolute;bottom:0;left:0;height:2px;width:0;"
         "background:linear-gradient(90deg,#f7931e,#ff9a5c);box-shadow:0 0 14px #ff6b35;"
         "animation:timeFill 4.8s linear .2s forwards;}"
