@@ -1171,6 +1171,32 @@ def _movers_dataframe(quotes: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# Yahoo symbol suffixes per market — used to scope search results across pages.
+MARKET_SUFFIXES = {
+    "USA": set(),  # US tickers carry no exchange suffix (handled specially)
+    "Hong Kong": {".HK"},
+    "India": {".NS", ".BO"},
+    "Europe": {".L", ".DE", ".PA", ".AS", ".MI", ".MC", ".SW", ".CO",
+               ".ST", ".BR", ".VI", ".LS", ".HE", ".OL", ".IR", ".F", ".DE"},
+    "Asia (ex-HK/India)": {".T", ".KS", ".KQ", ".TW", ".TWO", ".SI", ".AX", ".HK"},
+}
+
+
+def _symbol_in_markets(symbol: str, markets: list[str]) -> bool:
+    """True if the ticker belongs to one of the selected markets (by suffix)."""
+    sym = (symbol or "").upper()
+    has_dot = "." in sym
+    for m in markets:
+        if m == "USA":
+            if not has_dot:  # US tickers have no exchange suffix
+                return True
+        else:
+            for suf in MARKET_SUFFIXES.get(m, set()):
+                if sym.endswith(suf):
+                    return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Stock Valuation page — 5-year DCF + comps + sensitivity (yfinance data).
 # Faithful port of the live-stock-valuation model.
@@ -2364,31 +2390,6 @@ if _active_view == "💰 Stock Valuation":
 WATCHLIST_KEY = "_watchlist_selection"
 CUSTOM_KEY = "_custom_tickers"      # tickers the user typed (sticky across reruns)
 PRESET_SYMS_KEY = "_preset_symbols"  # symbols available from current presets
-
-# Yahoo symbol suffixes per market — used to scope search results.
-MARKET_SUFFIXES = {
-    "USA": set(),  # US tickers carry no exchange suffix (handled specially)
-    "Hong Kong": {".HK"},
-    "India": {".NS", ".BO"},
-    "Europe": {".L", ".DE", ".PA", ".AS", ".MI", ".MC", ".SW", ".CO",
-               ".ST", ".BR", ".VI", ".LS", ".HE", ".OL", ".IR", ".F", ".DE"},
-    "Asia (ex-HK/India)": {".T", ".KS", ".KQ", ".TW", ".TWO", ".SI", ".AX", ".HK"},
-}
-
-
-def _symbol_in_markets(symbol: str, markets: list[str]) -> bool:
-    """True if the ticker belongs to one of the selected markets (by suffix)."""
-    sym = (symbol or "").upper()
-    has_dot = "." in sym
-    for m in markets:
-        if m == "USA":
-            if not has_dot:  # US tickers have no exchange suffix
-                return True
-        else:
-            for suf in MARKET_SUFFIXES.get(m, set()):
-                if sym.endswith(suf):
-                    return True
-    return False
 
 
 def _normalize_watchlist() -> None:
