@@ -15,6 +15,7 @@ import base64
 import json
 import math
 import re
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -2156,17 +2157,26 @@ def _rec_color(rec: str) -> str:
 # App
 # ---------------------------------------------------------------------------
 
-_LOGO_PATH = Path(__file__).parent / "logo.png"
+# Logo: prefer the SVG, fall back to PNG. Build a base64 data URI for inline use.
+_LOGO_DIR = Path(__file__).parent
+_LOGO_PATH = next((_LOGO_DIR / n for n in ("logo.svg", "logo.png") if (_LOGO_DIR / n).exists()), None)
+_LOGO_DATA_URI = ""
+if _LOGO_PATH:
+    try:
+        _mime = "image/svg+xml" if _LOGO_PATH.suffix == ".svg" else "image/png"
+        _LOGO_DATA_URI = f"data:{_mime};base64," + base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
+    except Exception:
+        _LOGO_DATA_URI = ""
 
 st.set_page_config(
     page_title="CAPRA Finance",
-    page_icon=str(_LOGO_PATH) if _LOGO_PATH.exists() else "📊",
+    page_icon=str(_LOGO_PATH) if _LOGO_PATH else "📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # Sidebar/top-bar branding (Streamlit's first-class logo slot).
-if _LOGO_PATH.exists():
+if _LOGO_PATH:
     try:
         st.logo(str(_LOGO_PATH), size="large")
     except Exception:
@@ -2337,22 +2347,76 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------------
+# Cinematic intro — Nolan-style logo reveal, plays once per browser session.
+# A CSS-driven full-screen overlay renders, then the server sleeps while it
+# animates, then reruns into the app. (Audio can't autoplay in browsers, so the
+# drama is purely visual: slow fades, monumental type, a single violet accent.)
+# ---------------------------------------------------------------------------
+if not st.session_state.get("_intro_done"):
+    _intro_logo = (
+        f'<img class="logo" src="{_LOGO_DATA_URI}"/>' if _LOGO_DATA_URI
+        else '<div class="logo" style="display:flex;align-items:center;justify-content:center;'
+             'font-weight:800;font-size:3.5rem;color:#0a0a0f;">C</div>'
+    )
+    st.markdown(
+        "<style>"
+        '[data-testid="stHeader"]{display:none!important;}'
+        ".stApp{background:#000!important;}"
+        "#capra-intro{position:fixed;inset:0;z-index:2147483000;background:#000;display:flex;"
+        "flex-direction:column;align-items:center;justify-content:center;overflow:hidden;"
+        "font-family:'Inter',-apple-system,sans-serif;animation:introOut .7s ease 4.8s forwards;}"
+        "#capra-intro .vignette{position:absolute;inset:0;background:"
+        "radial-gradient(circle at 50% 44%,rgba(99,102,241,.12),rgba(0,0,0,0) 55%),"
+        "radial-gradient(circle at 50% 50%,rgba(0,0,0,0) 38%,#000 100%);pointer-events:none;}"
+        "#capra-intro .logo{width:138px;height:138px;border-radius:26px;background:#fff;opacity:0;"
+        "transform:scale(.7);animation:logoIn 1.6s cubic-bezier(.2,.7,.2,1) .3s forwards,"
+        "logoGlow 2.4s ease 1.4s forwards;}"
+        "#capra-intro .line{width:0;height:1px;margin-top:32px;"
+        "background:linear-gradient(90deg,transparent,#8b5cf6,transparent);"
+        "animation:lineGrow 1.4s ease 1.2s forwards;}"
+        "#capra-intro .word{margin-top:28px;font-weight:800;font-size:clamp(2.4rem,7vw,4.8rem);"
+        "color:#fff;letter-spacing:.06em;text-align:center;line-height:1;opacity:0;"
+        "animation:wordIn 1.4s ease 1.9s forwards;}"
+        "#capra-intro .word .sub{display:block;font-size:.24em;font-weight:600;letter-spacing:.55em;"
+        "color:#a78bfa;margin-top:14px;opacity:0;animation:wordIn 1.2s ease 2.6s forwards;}"
+        "#capra-intro .tag{margin-top:26px;font-size:.78rem;font-weight:500;letter-spacing:.5em;"
+        "color:#64748b;text-transform:uppercase;opacity:0;animation:wordIn 1.2s ease 3.2s forwards;}"
+        "#capra-intro .timebar{position:absolute;bottom:0;left:0;height:2px;width:0;"
+        "background:linear-gradient(90deg,#6366f1,#a78bfa);box-shadow:0 0 14px #8b5cf6;"
+        "animation:timeFill 4.8s linear .2s forwards;}"
+        "@keyframes logoIn{to{opacity:1;transform:scale(1);}}"
+        "@keyframes logoGlow{0%{box-shadow:0 0 0 rgba(139,92,246,0);}"
+        "50%{box-shadow:0 0 72px rgba(139,92,246,.55);}100%{box-shadow:0 0 38px rgba(139,92,246,.30);}}"
+        "@keyframes lineGrow{to{width:min(440px,72vw);}}"
+        "@keyframes wordIn{to{opacity:1;}}"
+        "@keyframes timeFill{to{width:100%;}}"
+        "@keyframes introOut{to{opacity:0;visibility:hidden;}}"
+        "</style>"
+        '<div id="capra-intro"><div class="vignette"></div>'
+        f"{_intro_logo}"
+        '<div class="line"></div>'
+        '<div class="word">CAPRA<span class="sub">FINANCE</span></div>'
+        '<div class="tag">Global Market Intelligence</div>'
+        '<div class="timebar"></div></div>',
+        unsafe_allow_html=True,
+    )
+    time.sleep(5.6)
+    st.session_state["_intro_done"] = True
+    st.rerun()
+
 # Persistent user state (portfolio + alerts). Loaded from JSON on disk.
 if "user_state" not in st.session_state:
     st.session_state.user_state = load_storage()
 
-# Top header — CAPRA wordmark + tagline. Logo image used when available.
+# Top header — CAPRA logo badge + wordmark + tagline.
 _logo_inline = ""
-if _LOGO_PATH.exists():
-    try:
-        _logo_b64 = base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
-        _logo_inline = (
-            f'<img src="data:image/png;base64,{_logo_b64}" '
-            f'style="height:54px;width:auto;border-radius:8px;'
-            f'box-shadow:0 4px 16px rgba(139,92,246,0.15);">'
-        )
-    except Exception:
-        _logo_inline = ""
+if _LOGO_DATA_URI:
+    _logo_inline = (
+        f'<img src="{_LOGO_DATA_URI}" '
+        f'style="height:52px;width:52px;border-radius:12px;background:#fff;'
+        f'object-fit:cover;box-shadow:0 4px 18px rgba(139,92,246,0.25);">'
+    )
 
 st.markdown(
     f'<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0 14px 0;">'
