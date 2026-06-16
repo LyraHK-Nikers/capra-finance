@@ -77,20 +77,30 @@ PERIOD_TO_YEARS = {"1y": 1, "3y": 3, "5y": 5, "10y": 10}
 # Data fetching (cached). yfinance is rate-limited so we cache aggressively.
 # ---------------------------------------------------------------------------
 
+def _download_retry(tickers: tuple[str, ...], attempts: int = 3, delay: float = 0.7, **kwargs) -> pd.DataFrame:
+    """yf.download with retries — Yahoo intermittently returns empty under load."""
+    data = pd.DataFrame()
+    for i in range(attempts):
+        try:
+            data = yf.download(
+                list(tickers), group_by="ticker", auto_adjust=True,
+                progress=False, threads=True, **kwargs,
+            )
+        except Exception:
+            data = pd.DataFrame()
+        if data is not None and not data.empty:
+            return data
+        if i < attempts - 1:
+            time.sleep(delay)
+    return data if data is not None else pd.DataFrame()
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_history(tickers: tuple[str, ...], period: str = "5y", interval: str = "1d") -> pd.DataFrame:
     """Return adjusted close prices as a wide DataFrame indexed by date."""
     if not tickers:
         return pd.DataFrame()
-    data = yf.download(
-        list(tickers),
-        period=period,
-        interval=interval,
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    data = _download_retry(tickers, period=period, interval=interval)
     if data.empty:
         return pd.DataFrame()
 
@@ -113,15 +123,7 @@ def fetch_history(tickers: tuple[str, ...], period: str = "5y", interval: str = 
 def fetch_volume(tickers: tuple[str, ...], period: str = "1mo") -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame()
-    data = yf.download(
-        list(tickers),
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    data = _download_retry(tickers, period=period, interval="1d")
     if data.empty:
         return pd.DataFrame()
     if isinstance(data.columns, pd.MultiIndex):
@@ -140,15 +142,8 @@ def fetch_intraday(tickers: tuple[str, ...]) -> pd.DataFrame:
     """Most recent 1-day, 5-minute bars — used for the live-ish quote tiles."""
     if not tickers:
         return pd.DataFrame()
-    data = yf.download(
-        list(tickers),
-        period="1d",
-        interval="5m",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    # Intraday is non-critical (cards fall back to daily close), so don't retry hard.
+    data = _download_retry(tickers, attempts=2, delay=0.4, period="1d", interval="5m")
     if data.empty:
         return pd.DataFrame()
     if isinstance(data.columns, pd.MultiIndex):
@@ -164,11 +159,20 @@ def fetch_intraday(tickers: tuple[str, ...]) -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_info(ticker: str) -> dict:
-    """Fundamentals + analyst targets. Cached longer since this rarely changes intraday."""
-    try:
-        return yf.Ticker(ticker).info or {}
-    except Exception:
-        return {}
+    """Fundamentals + analyst targets, with a retry when Yahoo throttles .info."""
+    info = {}
+    for i in range(2):
+        try:
+            info = yf.Ticker(ticker).info or {}
+        except Exception:
+            info = {}
+        # A usable payload has at least a price or a name.
+        if info.get("regularMarketPrice") or info.get("currentPrice") \
+                or info.get("shortName") or info.get("longName"):
+            return info
+        if i == 0:
+            time.sleep(0.5)
+    return info
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -227,11 +231,19 @@ def fetch_symbol_search(query: str, limit: int = 8) -> list[dict]:
     q = (query or "").strip()
     if len(q) < 2:
         return []
-    try:
-        import urllib.parse
-        url = "https://query2.finance.yahoo.com/v1/finance/search?q=" + urllib.parse.quote(q)
-        data = _http_get_json(url, timeout=10)
-    except Exception:
+    import urllib.parse
+    url = "https://query2.finance.yahoo.com/v1/finance/search?q=" + urllib.parse.quote(q)
+    data = None
+    for i in range(2):
+        try:
+            data = _http_get_json(url, timeout=10)
+        except Exception:
+            data = None
+        if data:
+            break
+        if i == 0:
+            time.sleep(0.5)
+    if not data:
         return []
     out: list[dict] = []
     for it in (data.get("quotes", []) if isinstance(data, dict) else []):
@@ -1094,32 +1106,44 @@ MOVER_MARKETS: dict[str, dict] = {
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_screener(key: str, count: int = 50) -> list[dict]:
     """Yahoo predefined screener (day_gainers / day_losers / most_actives)."""
-    try:
-        res = yf.screen(key, count=count)
-        return res.get("quotes", []) if isinstance(res, dict) else []
-    except Exception:
-        return []
+    for i in range(3):
+        try:
+            res = yf.screen(key, count=count)
+            quotes = res.get("quotes", []) if isinstance(res, dict) else []
+        except Exception:
+            quotes = []
+        if quotes:
+            return quotes
+        if i < 2:
+            time.sleep(0.6)
+    return []
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_region_movers(regions: tuple, direction: str, min_mcap: float, count: int = 50) -> list[dict]:
     """Region-filtered movers. direction: 'gainers' | 'losers' | 'active'."""
-    try:
-        from yfinance import EquityQuery
-        base = [
-            EquityQuery("is-in", ["region", *regions]),
-            EquityQuery("gt", ["dayvolume", 100000]),
-            EquityQuery("gt", ["intradaymarketcap", min_mcap]),
-        ]
-        q = EquityQuery("and", base)
-        if direction == "active":
-            sort_field, asc = "dayvolume", False
-        else:
-            sort_field, asc = "percentchange", (direction == "losers")
-        res = yf.screen(q, sortField=sort_field, sortAsc=asc, count=count * 2)
-        quotes = res.get("quotes", []) if isinstance(res, dict) else []
-    except Exception:
-        return []
+    from yfinance import EquityQuery
+    base = [
+        EquityQuery("is-in", ["region", *regions]),
+        EquityQuery("gt", ["dayvolume", 100000]),
+        EquityQuery("gt", ["intradaymarketcap", min_mcap]),
+    ]
+    q = EquityQuery("and", base)
+    if direction == "active":
+        sort_field, asc = "dayvolume", False
+    else:
+        sort_field, asc = "percentchange", (direction == "losers")
+    quotes = []
+    for i in range(3):
+        try:
+            res = yf.screen(q, sortField=sort_field, sortAsc=asc, count=count * 2)
+            quotes = res.get("quotes", []) if isinstance(res, dict) else []
+        except Exception:
+            quotes = []
+        if quotes:
+            break
+        if i < 2:
+            time.sleep(0.6)
     # Post-filter on the returned marketCap to drop micro-cap stragglers
     # (some listings bypass the intradaymarketcap query filter).
     clean = [q for q in quotes if (q.get("marketCap") or 0) >= min_mcap * 0.5]
@@ -1983,7 +2007,14 @@ money is flowing *today*.
             actives = _movers_dataframe(fetch_region_movers(regions, "active", mcap, 50))
 
     if gainers.empty and losers.empty:
-        st.error(f"Couldn't load {market} movers right now — Yahoo may be rate-limiting. Try again shortly.")
+        st.warning(
+            f"⏳ Yahoo's screener didn't return {market} movers just now — usually temporary "
+            "rate-limiting, not an app problem. Wait a few seconds and click **Retry**."
+        )
+        if st.button("🔄 Retry", key="movers_retry"):
+            fetch_screener.clear()
+            fetch_region_movers.clear()
+            st.rerun()
         return
 
     # KPI strip — company name as the headline, symbol + rating as context.
@@ -2781,7 +2812,14 @@ with st.spinner(f"Loading {len(chosen_tickers)} tickers + benchmark…"):
     bench_df = fetch_history((benchmark_symbol,), period=period)
 
 if prices_df.empty:
-    st.error("Could not load any price data. Yahoo Finance may be rate-limiting — wait a moment and click Refresh.")
+    st.warning(
+        "⏳ Yahoo Finance didn't return price data just now — almost always temporary rate-limiting "
+        "(common on shared/cloud servers), **not** a problem with your tickers or the app. "
+        "Wait a few seconds and click **Retry**."
+    )
+    if st.button("🔄 Retry", key="prices_retry"):
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
 
 bench_series = bench_df.iloc[:, 0] if not bench_df.empty else pd.Series(dtype=float)
