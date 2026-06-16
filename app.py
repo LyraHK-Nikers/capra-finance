@@ -1308,36 +1308,132 @@ def _implied_growth(base: dict, a: dict, lo: float = -0.5, hi: float = 1.0) -> t
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_valuation_base(ticker: str) -> dict | None:
-    """Pull the fundamentals the DCF needs from Yahoo. Returns None if unusable."""
-    info = fetch_info(ticker)
-    if not info:
-        return None
+    """Pull the fundamentals the DCF needs from Yahoo — resilient to throttling.
+
+    Tries .info first; when Yahoo rate-limits it (common on shared/cloud IPs),
+    falls back to fast_info, the income statement, the balance sheet, and price
+    history so the page still works. Returns None only if price/shares/revenue
+    can't be obtained from ANY source.
+    """
+    tk = yf.Ticker(ticker)
+
+    # 1) .info — retry once if it comes back empty (transient throttle).
+    info = {}
+    for attempt in range(2):
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        if info.get("currentPrice") or info.get("regularMarketPrice") or info.get("totalRevenue"):
+            break
+        if attempt == 0:
+            time.sleep(0.6)
+
     price = info.get("currentPrice") or info.get("regularMarketPrice")
     shares = info.get("sharesOutstanding")
     rev = info.get("totalRevenue")
+    margin = info.get("operatingMargins")
+    ni = info.get("netIncomeToCommon") or info.get("netIncome")
+    debt = info.get("totalDebt")
+    cash = info.get("totalCash")
+    g1 = info.get("revenueGrowth")
+    name = info.get("shortName") or info.get("longName")
+    currency = info.get("currency")
+    beta = info.get("beta")
+    pe = info.get("trailingPE")
+    ev_ebitda = info.get("enterpriseToEbitda")
+    sector = info.get("sector")
+
+    # 2) fast_info — lighter endpoint, often survives when .info is throttled.
+    try:
+        fi = tk.fast_info
+        def _fi(attr):
+            try:
+                return fi[attr] if hasattr(fi, "__getitem__") else getattr(fi, attr, None)
+            except Exception:
+                return getattr(fi, attr, None)
+        price = price or _fi("last_price") or _fi("lastPrice")
+        shares = shares or _fi("shares")
+        currency = currency or _fi("currency")
+    except Exception:
+        pass
+
+    # 3) Price from recent history if still missing.
+    if not price:
+        try:
+            h = fetch_history((ticker,), period="5d")
+            if not h.empty and ticker in h.columns:
+                s = h[ticker].dropna()
+                if not s.empty:
+                    price = float(s.iloc[-1])
+        except Exception:
+            pass
+
+    # 4) Income statement — revenue / margin / net income / YoY growth.
+    if (not rev) or (margin is None) or (not ni) or (g1 is None):
+        try:
+            inc = tk.income_stmt
+        except Exception:
+            inc = None
+        if inc is not None and not getattr(inc, "empty", True):
+            def _row(label):
+                try:
+                    return float(inc.loc[label].iloc[0]) if label in inc.index else None
+                except Exception:
+                    return None
+            rev = rev or _row("Total Revenue") or _row("Operating Revenue")
+            op_inc = _row("Operating Income")
+            ni = ni or _row("Net Income") or _row("Net Income Common Stockholders")
+            if margin is None and rev and op_inc:
+                margin = op_inc / rev
+            if g1 is None and "Total Revenue" in inc.index and inc.shape[1] >= 2:
+                try:
+                    r0, r1 = inc.loc["Total Revenue"].iloc[0], inc.loc["Total Revenue"].iloc[1]
+                    if r1:
+                        g1 = float(r0 / r1 - 1)
+                except Exception:
+                    pass
+
+    # 5) Balance sheet — debt / cash if missing.
+    if debt is None or cash is None:
+        try:
+            bs = tk.balance_sheet
+            if bs is not None and not getattr(bs, "empty", True):
+                def _b(label):
+                    try:
+                        return float(bs.loc[label].iloc[0]) if label in bs.index else None
+                    except Exception:
+                        return None
+                if debt is None:
+                    debt = _b("Total Debt")
+                if cash is None:
+                    cash = _b("Cash And Cash Equivalents") or _b("Cash Cash Equivalents And Short Term Investments")
+        except Exception:
+            pass
+
+    # Must have the three essentials from somewhere.
     if not (price and shares and rev):
         return None
-    margin = info.get("operatingMargins")
-    if margin is None:
-        margin = info.get("profitMargins") or 0.10
-    g1 = info.get("revenueGrowth")
-    if g1 is None:
-        g1 = info.get("earningsGrowth") or 0.08
+
+    margin = margin if margin is not None else (info.get("profitMargins") or 0.10)
+    g1 = g1 if g1 is not None else (info.get("earningsGrowth") or 0.08)
+    ni = ni if ni is not None else rev * margin * 0.8
+
     return {
-        "name": info.get("shortName") or info.get("longName") or ticker,
+        "name": name or ticker,
         "price": float(price),
         "shares": float(shares),
         "rev": float(rev),
         "margin": float(margin),
-        "ni": float(info.get("netIncomeToCommon") or info.get("netIncome") or rev * margin * 0.8),
-        "debt": float(info.get("totalDebt") or 0),
-        "cash": float(info.get("totalCash") or 0),
+        "ni": float(ni),
+        "debt": float(debt or 0),
+        "cash": float(cash or 0),
         "g1": float(g1),
-        "currency": info.get("currency", "USD"),
-        "pe": info.get("trailingPE"),
-        "ev_ebitda": info.get("enterpriseToEbitda"),
-        "sector": info.get("sector", "—"),
-        "beta": info.get("beta"),
+        "currency": currency or "USD",
+        "pe": pe,
+        "ev_ebitda": ev_ebitda,
+        "sector": sector or "—",
+        "beta": beta,
     }
 
 
@@ -1510,8 +1606,14 @@ A narrow range = robust thesis; a wild range = fragile.
 
     base = fetch_valuation_base(chosen)
     if not base:
-        st.error(f"Couldn't load enough fundamentals for **{chosen}** to run a DCF "
-                 "(needs price, shares outstanding, and revenue). Try a larger, well-covered company.")
+        st.warning(
+            f"⏳ Yahoo Finance didn't return fundamentals for **{chosen}** just now — this is almost "
+            "always temporary rate-limiting (especially on shared/cloud servers), **not** a problem with "
+            "the stock or the app. Wait a few seconds and click **Retry**."
+        )
+        if st.button("🔄 Retry", key="val_retry"):
+            fetch_valuation_base.clear()  # drop the cached empty result
+            st.rerun()
         return
 
     cur = base["currency"]
