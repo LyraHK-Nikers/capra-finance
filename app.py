@@ -1196,6 +1196,48 @@ def _movers_dataframe(quotes: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _sparkline_svg(values, width: int = 140, height: int = 36, max_points: int = 80) -> str:
+    """Inline SVG sparkline with a soft gradient area fill. Green if up, red if down.
+
+    Module-level so every page (live tiles, valuation card, …) can use it.
+    """
+    vals = [float(v) for v in values if v == v]  # drop NaN
+    if len(vals) < 2:
+        return '<div style="height:36px;display:flex;align-items:center;color:#475569;font-size:0.65rem;">no data</div>'
+
+    # Downsample evenly so 5Y daily (~1250 pts) stays light across many cards.
+    if len(vals) > max_points:
+        step = len(vals) / max_points
+        vals = [vals[int(i * step)] for i in range(max_points)]
+
+    lo, hi = min(vals), max(vals)
+    rng = (hi - lo) or 1.0
+    n = len(vals)
+    pts = []
+    for i, v in enumerate(vals):
+        x = (i / (n - 1)) * (width - 2) + 1
+        y = (height - 2) - ((v - lo) / rng) * (height - 4) + 1
+        pts.append((x, y))
+
+    up = vals[-1] >= vals[0]
+    color = "#10b981" if up else "#ef4444"
+    gid = f"sg{abs(hash((round(vals[0], 4), round(vals[-1], 4), n))) % 100000}"
+    line_pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    area_pts = f"1,{height-1} " + line_pts + f" {width-1},{height-1}"
+    return (
+        f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
+        f'style="width:100%;height:{height}px;display:block;">'
+        f'<defs><linearGradient id="{gid}" x1="0" x2="0" y1="0" y2="1">'
+        f'<stop offset="0%" stop-color="{color}" stop-opacity="0.35"/>'
+        f'<stop offset="100%" stop-color="{color}" stop-opacity="0"/>'
+        f'</linearGradient></defs>'
+        f'<polygon points="{area_pts}" fill="url(#{gid})" stroke="none"/>'
+        f'<polyline points="{line_pts}" fill="none" stroke="{color}" '
+        f'stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>'
+        f'</svg>'
+    )
+
+
 # Yahoo symbol suffixes per market — used to scope search results across pages.
 MARKET_SUFFIXES = {
     "USA": set(),  # US tickers carry no exchange suffix (handled specially)
@@ -2978,43 +3020,6 @@ if not all_metrics:
 
 
 # ---- Live quote tiles (auto-refresh fragment) ---------------------------
-def _sparkline_svg(values, width: int = 140, height: int = 36, max_points: int = 80) -> str:
-    """Inline SVG sparkline with a soft gradient area fill. Green if up, red if down."""
-    vals = [float(v) for v in values if v == v]  # drop NaN
-    if len(vals) < 2:
-        return '<div style="height:36px;display:flex;align-items:center;color:#475569;font-size:0.65rem;">no data</div>'
-
-    # Downsample evenly so 5Y daily (~1250 pts) stays light across many cards.
-    if len(vals) > max_points:
-        step = len(vals) / max_points
-        vals = [vals[int(i * step)] for i in range(max_points)]
-
-    lo, hi = min(vals), max(vals)
-    rng = (hi - lo) or 1.0
-    n = len(vals)
-    pts = []
-    for i, v in enumerate(vals):
-        x = (i / (n - 1)) * (width - 2) + 1
-        y = (height - 2) - ((v - lo) / rng) * (height - 4) + 1
-        pts.append((x, y))
-
-    up = vals[-1] >= vals[0]
-    color = "#10b981" if up else "#ef4444"
-    gid = f"sg{abs(hash((round(vals[0], 4), round(vals[-1], 4), n))) % 100000}"
-    line_pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
-    area_pts = f"1,{height-1} " + line_pts + f" {width-1},{height-1}"
-    return (
-        f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
-        f'style="width:100%;height:{height}px;display:block;">'
-        f'<defs><linearGradient id="{gid}" x1="0" x2="0" y1="0" y2="1">'
-        f'<stop offset="0%" stop-color="{color}" stop-opacity="0.35"/>'
-        f'<stop offset="100%" stop-color="{color}" stop-opacity="0"/>'
-        f'</linearGradient></defs>'
-        f'<polygon points="{area_pts}" fill="url(#{gid})" stroke="none"/>'
-        f'<polyline points="{line_pts}" fill="none" stroke="{color}" '
-        f'stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>'
-        f'</svg>'
-    )
 
 
 def _growth_line(label: str, value: float | None) -> str:
