@@ -95,7 +95,12 @@ def _download_retry(tickers: tuple[str, ...], attempts: int = 3, delay: float = 
     return data if data is not None else pd.DataFrame()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+# Daily history barely changes second-to-second; live price freshness comes from
+# fetch_intraday (30s). Long TTL here slashes the heaviest, most rate-limit-prone calls.
+DAILY_TTL = 900
+
+
+@st.cache_data(ttl=DAILY_TTL, show_spinner=False)
 def fetch_history(tickers: tuple[str, ...], period: str = "5y", interval: str = "1d") -> pd.DataFrame:
     """Return adjusted close prices as a wide DataFrame indexed by date."""
     if not tickers:
@@ -114,12 +119,14 @@ def fetch_history(tickers: tuple[str, ...], period: str = "5y", interval: str = 
                 continue
         df = pd.DataFrame(closes)
     else:
+        if "Close" not in data.columns:  # malformed single-ticker payload
+            return pd.DataFrame()
         df = data[["Close"]].rename(columns={"Close": tickers[0]})
 
     return df.dropna(how="all")
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=DAILY_TTL, show_spinner=False)
 def fetch_volume(tickers: tuple[str, ...], period: str = "1mo") -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame()
@@ -134,6 +141,8 @@ def fetch_volume(tickers: tuple[str, ...], period: str = "1mo") -> pd.DataFrame:
             except (KeyError, ValueError):
                 continue
         return pd.DataFrame(vols).dropna(how="all")
+    if "Volume" not in data.columns:
+        return pd.DataFrame()
     return data[["Volume"]].rename(columns={"Volume": tickers[0]})
 
 
@@ -154,25 +163,40 @@ def fetch_intraday(tickers: tuple[str, ...]) -> pd.DataFrame:
             except (KeyError, ValueError):
                 continue
         return pd.DataFrame(out)
+    if "Close" not in data.columns:
+        return pd.DataFrame()
     return data[["Close"]].rename(columns={"Close": tickers[0]})
 
 
+def _info_usable(info: dict) -> bool:
+    return bool(info.get("regularMarketPrice") or info.get("currentPrice")
+                or info.get("shortName") or info.get("longName"))
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_info(ticker: str) -> dict:
-    """Fundamentals + analyst targets, with a retry when Yahoo throttles .info."""
+def _fetch_info_cached(ticker: str) -> dict:
+    """Cached fundamentals. RAISES on a throttled/empty payload so st.cache_data
+    does NOT memoize the failure (exceptions are not cached) — a later call retries
+    instead of being stuck with '—' for 10 minutes."""
     info = {}
     for i in range(2):
         try:
             info = yf.Ticker(ticker).info or {}
         except Exception:
             info = {}
-        # A usable payload has at least a price or a name.
-        if info.get("regularMarketPrice") or info.get("currentPrice") \
-                or info.get("shortName") or info.get("longName"):
+        if _info_usable(info):
             return info
         if i == 0:
             time.sleep(0.5)
-    return info
+    raise RuntimeError("empty info payload (throttled)")  # not cached
+
+
+def fetch_info(ticker: str) -> dict:
+    """Public, safe accessor — returns {} on a throttled/empty fetch (uncached)."""
+    try:
+        return _fetch_info_cached(ticker)
+    except Exception:
+        return {}
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -560,29 +584,43 @@ def _rsi(prices: pd.Series, window: int = 14) -> float:
     return float(rsi.iloc[-1])
 
 
+@st.cache_data(ttl=DAILY_TTL, show_spinner=False)
+def _forecast_cached(values: tuple, horizon: int) -> tuple[float, list]:
+    """Heavy part of the forecast (an ExponentialSmoothing fit per ticker), memoized
+    so identical price series within the cache window reuse the fit instead of
+    re-optimizing 50–100 models on every rerun."""
+    series = np.asarray(values, dtype=float)
+    series = series[~np.isnan(series)]
+    if len(series) < 60:
+        return float("nan"), []
+
+    if HAS_STATSMODELS and len(series) >= 120:
+        try:
+            model = ExponentialSmoothing(
+                series, trend="add", seasonal=None, initialization_method="estimated"
+            ).fit(optimized=True)
+            forecast_path = np.asarray(model.forecast(horizon))
+            return float(forecast_path[-1]), forecast_path.tolist()
+        except Exception:
+            pass
+
+    # Fallback: linear regression on log-prices (geometric trend).
+    log_prices = np.log(series)
+    x = np.arange(len(log_prices)).reshape(-1, 1)
+    model = LinearRegression().fit(x, log_prices)
+    future_x = np.arange(len(log_prices), len(log_prices) + horizon).reshape(-1, 1)
+    forecast_path = np.exp(model.predict(future_x))
+    return float(forecast_path[-1]), forecast_path.tolist()
+
+
 def _forecast(prices: pd.Series, horizon: int = 30) -> tuple[float, np.ndarray]:
     """Forecast `horizon` trading days ahead. Returns (point_estimate, full_path)."""
     series = prices.dropna()
     if len(series) < 60:
         return float("nan"), np.array([])
-
-    if HAS_STATSMODELS and len(series) >= 120:
-        try:
-            model = ExponentialSmoothing(
-                series.values, trend="add", seasonal=None, initialization_method="estimated"
-            ).fit(optimized=True)
-            forecast_path = model.forecast(horizon)
-            return float(forecast_path[-1]), np.asarray(forecast_path)
-        except Exception:
-            pass
-
-    # Fallback: linear regression on log-prices (geometric trend).
-    log_prices = np.log(series.values)
-    x = np.arange(len(log_prices)).reshape(-1, 1)
-    model = LinearRegression().fit(x, log_prices)
-    future_x = np.arange(len(log_prices), len(log_prices) + horizon).reshape(-1, 1)
-    forecast_path = np.exp(model.predict(future_x))
-    return float(forecast_path[-1]), forecast_path
+    key = tuple(round(float(v), 4) for v in series.values)
+    point, path = _forecast_cached(key, horizon)
+    return point, np.asarray(path)
 
 
 def _risk_level(volatility: float, max_dd: float) -> str:
@@ -1327,11 +1365,14 @@ def _dcf_price_gm(base: dict, a: dict, g: float, m: float) -> float:
 def _dcf_price_w(base: dict, a: dict, w: float, tg: float) -> float:
     """DCF per-share varying WACC w and terminal growth tg (sensitivity)."""
     pr = _dcf_project(base, a)
-    if w <= tg or not base["shares"]:
+    # Require a real spread between WACC and terminal growth, else the terminal term
+    # explodes toward ±inf and the heatmap cell becomes garbage.
+    if (w - tg) < 0.005 or not base["shares"]:
         return float("nan")
     s = sum(r["fcf"] / (1 + w) ** r["t"] for r in pr)
     last = pr[-1]["fcf"]
-    return (s + (last * (1 + tg) / (w - tg)) / (1 + w) ** 5 - (base["debt"] - base["cash"])) / base["shares"]
+    val = (s + (last * (1 + tg) / (w - tg)) / (1 + w) ** 5 - (base["debt"] - base["cash"])) / base["shares"]
+    return val if math.isfinite(val) else float("nan")
 
 
 def _capm_wacc(base: dict, rf: float, erp: float, tax: float) -> float:
@@ -1351,9 +1392,15 @@ def _capm_wacc(base: dict, rf: float, erp: float, tax: float) -> float:
 def _implied_growth(base: dict, a: dict, lo: float = -0.5, hi: float = 1.0) -> tuple[float, str]:
     """Reverse DCF: solve for the constant 5-yr growth the CURRENT PRICE implies.
 
-    DCF price is monotonically increasing in growth, so bisection converges.
+    Bisection only works while DCF price is monotonically INCREASING in growth, which
+    holds only when per-revenue free cash flow is positive. For unprofitable firms the
+    coefficient `margin·(1-tax) + D&A − capex` is ≤ 0, FCF goes more negative as growth
+    rises, and the solve would return a confidently-wrong number — so we bail to NaN.
     Returns (growth, edge) where edge is 'below' / 'above' / 'exact'.
     """
+    fcf_coef = base["margin"] * (1 - a["tax"]) + a["da"] - a["capex"]
+    if fcf_coef <= 0:
+        return float("nan"), "exact"  # non-monotonic regime → UI shows "—"
     def f(g):  # DCF price at growth g (current margin) minus the market price
         return _dcf_price_gm(base, a, g, base["margin"]) - base["price"]
     flo, fhi = f(lo), f(hi)
@@ -1483,7 +1530,10 @@ def fetch_valuation_base(ticker: str) -> dict | None:
 
     margin = margin if margin is not None else (info.get("profitMargins") or 0.10)
     g1 = g1 if g1 is not None else (info.get("earningsGrowth") or 0.08)
-    ni = ni if ni is not None else rev * margin * 0.8
+    # Only synthesize net income when margin is genuinely positive — never force a
+    # loss-maker to look profitable (that would fabricate a positive P/E in comps).
+    if ni is None:
+        ni = rev * margin * 0.8 if margin > 0 else float("nan")
 
     return {
         "name": name or ticker,
@@ -1692,8 +1742,9 @@ A narrow range = robust thesis; a wild range = fragile.
         _vs = _vhist[chosen].dropna()
         if len(_vs) >= 2:
             pct_today = float(_vs.iloc[-1] / _vs.iloc[-2] - 1)
-        _spark_win = _vs[_vs.index >= _vs.index[-1] - pd.Timedelta(days=92)]
-        spark_html = _sparkline_svg(_spark_win.tolist(), width=320, height=44)
+        if not _vs.empty:  # guard: column could be all-NaN even when frame is non-empty
+            _spark_win = _vs[_vs.index >= _vs.index[-1] - pd.Timedelta(days=92)]
+            spark_html = _sparkline_svg(_spark_win.tolist(), width=320, height=44)
     _tcolor = _color(pct_today)
     _safe_name = (base["name"] or chosen).replace("<", "&lt;").replace(">", "&gt;")
     st.markdown(
@@ -2365,11 +2416,20 @@ def _rec_color(rec: str) -> str:
 # Logo: prefer the SVG, fall back to PNG. Build a base64 data URI for inline use.
 _LOGO_DIR = Path(__file__).parent
 _LOGO_PATH = next((_LOGO_DIR / n for n in ("logo.svg", "logo.png") if (_LOGO_DIR / n).exists()), None)
+
+
+@st.cache_resource(show_spinner=False)
+def _logo_data_uri(path_str: str, mtime: float) -> str:
+    """base64 the logo once per process (keyed on path+mtime) — not every rerun."""
+    p = Path(path_str)
+    mime = "image/svg+xml" if p.suffix == ".svg" else "image/png"
+    return f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode("ascii")
+
+
 _LOGO_DATA_URI = ""
 if _LOGO_PATH:
     try:
-        _mime = "image/svg+xml" if _LOGO_PATH.suffix == ".svg" else "image/png"
-        _LOGO_DATA_URI = f"data:{_mime};base64," + base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
+        _LOGO_DATA_URI = _logo_data_uri(str(_LOGO_PATH), _LOGO_PATH.stat().st_mtime)
     except Exception:
         _LOGO_DATA_URI = ""
 
