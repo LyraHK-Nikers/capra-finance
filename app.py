@@ -894,6 +894,72 @@ def _money(value) -> str:
     return f"{sign}${v:.0f}"
 
 
+# ---------------------------------------------------------------------------
+# Watchlist state + callbacks — module-level so every page (Global Stocks
+# sidebar, Top Movers "add to watchlist") can read/modify the watchlist.
+# ---------------------------------------------------------------------------
+WATCHLIST_KEY = "_watchlist_selection"
+CUSTOM_KEY = "_custom_tickers"        # tickers the user typed (sticky across reruns)
+PRESET_SYMS_KEY = "_preset_symbols"   # symbols available from current presets
+CUSTOM_NAMES_KEY = "_custom_names"    # {symbol: company name} for searched tickers
+
+
+def _normalize_watchlist() -> None:
+    """on_change for the watchlist box: uppercase, de-dupe, and remember any
+    user-typed ticker that isn't part of the preset universe so it sticks."""
+    raw = st.session_state.get(WATCHLIST_KEY, [])
+    seen, out = set(), []
+    for v in raw:
+        vu = str(v).strip().upper()
+        if vu and vu not in seen:
+            seen.add(vu)
+            out.append(vu)
+    st.session_state[WATCHLIST_KEY] = out
+    presets = st.session_state.get(PRESET_SYMS_KEY, set())
+    custom = st.session_state.setdefault(CUSTOM_KEY, [])
+    for vu in out:
+        if vu not in presets and vu not in custom:
+            custom.append(vu)
+
+
+def _set_watchlist(tickers) -> None:
+    """on_click for bulk buttons. Safe to set the widget key from a callback."""
+    st.session_state[WATCHLIST_KEY] = list(tickers)
+
+
+def _add_ticker(sym: str, name: str | None = None) -> None:
+    """Add a ticker to the watchlist and remember it (used by search + Top Movers)."""
+    sym = (sym or "").strip().upper()
+    if not sym:
+        return
+    wl = list(st.session_state.get(WATCHLIST_KEY, []))
+    if sym not in wl:
+        wl.append(sym)
+    st.session_state[WATCHLIST_KEY] = wl
+    custom = st.session_state.setdefault(CUSTOM_KEY, [])
+    if sym not in custom:
+        custom.append(sym)
+    if name:
+        st.session_state.setdefault(CUSTOM_NAMES_KEY, {})[sym] = name
+    st.session_state["symbol_search"] = ""  # clear the Global Stocks search box
+
+
+def _add_tickers_bulk(symbols: list[str]) -> None:
+    """on_click for Top Movers — add several tickers to the watchlist at once."""
+    wl = list(st.session_state.get(WATCHLIST_KEY, []))
+    custom = st.session_state.setdefault(CUSTOM_KEY, [])
+    for s in symbols:
+        s = (s or "").strip().upper()
+        if not s:
+            continue
+        if s not in wl:
+            wl.append(s)
+        if s not in custom:
+            custom.append(s)
+    st.session_state[WATCHLIST_KEY] = wl
+    st.session_state["movers_to_watchlist"] = []  # reset the picker after adding
+
+
 @st.dialog("📊 Company Details", width="large")
 def show_company_detail(ticker: str, display_name: str = "") -> None:
     info = fetch_info(ticker)
@@ -2588,6 +2654,27 @@ money is flowing *today*.
     if _clicked:
         show_company_detail(_clicked)
 
+    # --- Send movers straight to your watchlist (cross-link to Global Stocks) ---
+    st.divider()
+    st.markdown("##### ➕ Add movers to your watchlist")
+    _all_movers = sorted(set(gainers["Symbol"]).union(losers["Symbol"]).union(
+        actives["Symbol"] if not actives.empty else set()))
+    in_wl = set(st.session_state.get(WATCHLIST_KEY, []))
+    addable = [s for s in _all_movers if s not in in_wl]
+    ac1, ac2 = st.columns([3, 1])
+    picks = ac1.multiselect(
+        "Pick tickers to track on the Global Stocks page",
+        options=addable, key="movers_to_watchlist", label_visibility="collapsed",
+        placeholder="Pick movers to add to your watchlist…",
+    )
+    ac2.button(
+        f"➕ Add {len(picks)}" if picks else "➕ Add",
+        use_container_width=True, disabled=not picks,
+        on_click=_add_tickers_bulk, args=(picks,),
+    )
+    if picks:
+        ac1.caption("They'll appear on the **📈 Global Stocks** tab after you click Add.")
+
     st.divider()
     st.caption(
         "USA uses Yahoo's curated screener; other markets are region-filtered with a "
@@ -3121,54 +3208,8 @@ if _active_view == "🔬 Stock Analyzer":
     st.stop()
 
 # ---- Sidebar -------------------------------------------------------------
-WATCHLIST_KEY = "_watchlist_selection"
-CUSTOM_KEY = "_custom_tickers"      # tickers the user typed (sticky across reruns)
-PRESET_SYMS_KEY = "_preset_symbols"  # symbols available from current presets
-
-
-def _normalize_watchlist() -> None:
-    """on_change for the watchlist box: uppercase, de-dupe, and remember any
-    user-typed ticker that isn't part of the preset universe so it sticks."""
-    raw = st.session_state.get(WATCHLIST_KEY, [])
-    seen, out = set(), []
-    for v in raw:
-        vu = str(v).strip().upper()
-        if vu and vu not in seen:
-            seen.add(vu)
-            out.append(vu)
-    st.session_state[WATCHLIST_KEY] = out
-    presets = st.session_state.get(PRESET_SYMS_KEY, set())
-    custom = st.session_state.setdefault(CUSTOM_KEY, [])
-    for vu in out:
-        if vu not in presets and vu not in custom:
-            custom.append(vu)
-
-
-CUSTOM_NAMES_KEY = "_custom_names"  # {symbol: company name} for searched tickers
-
-
-def _set_watchlist(tickers) -> None:
-    """on_click for bulk buttons. Safe to set the widget key from a callback."""
-    st.session_state[WATCHLIST_KEY] = list(tickers)
-
-
-def _add_ticker(sym: str, name: str | None = None) -> None:
-    """on_click for search results — add a ticker to the watchlist and remember it."""
-    sym = (sym or "").strip().upper()
-    if not sym:
-        return
-    wl = list(st.session_state.get(WATCHLIST_KEY, []))
-    if sym not in wl:
-        wl.append(sym)
-    st.session_state[WATCHLIST_KEY] = wl
-    custom = st.session_state.setdefault(CUSTOM_KEY, [])
-    if sym not in custom:
-        custom.append(sym)
-    if name:
-        st.session_state.setdefault(CUSTOM_NAMES_KEY, {})[sym] = name
-    st.session_state["symbol_search"] = ""  # clear the search box after adding
-
-
+# (Watchlist constants + callbacks live at module top — see _add_ticker — so
+#  other pages like Top Movers can add tickers to the watchlist too.)
 with st.sidebar:
     st.header("Watchlist")
 
