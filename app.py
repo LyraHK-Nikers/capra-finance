@@ -1843,15 +1843,16 @@ def _analyzer_red_flags(d: dict) -> list[str]:
 
 
 def render_stock_analyzer() -> None:
+    """Combined deep-dive page: shared ticker search → Health Scorecard + DCF Valuation tabs."""
     st.markdown(
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">'
         '<h2 style="margin:0;">🔬 Stock Analyzer</h2>'
-        '<span style="color:#9ca3af;font-size:0.8rem;">Plain-English health scorecard · Yahoo data</span>'
+        '<span style="color:#9ca3af;font-size:0.8rem;">Plain-English scorecard + full DCF valuation · Yahoo data</span>'
         '</div>',
         unsafe_allow_html=True,
     )
-    st.caption("Type a ticker and get a beginner-friendly verdict: five health pillars, each metric rated "
-               "🟢 good / 🟡 okay / 🔴 watch with what it means and why it matters. Educational, not advice.")
+    st.caption("Search a stock once, then explore two views — a beginner-friendly health scorecard and a "
+               "full DCF valuation. Educational, not investment advice.")
 
     AN_MARKETS = {
         "🌐 All": None, "🇺🇸 USA": ["USA"], "🇭🇰 Hong Kong": ["Hong Kong"],
@@ -1883,6 +1884,15 @@ def render_stock_analyzer() -> None:
         st.info("Search a company or enter a ticker above to analyze it.")
         return
 
+    tab_health, tab_val = st.tabs(["📋 Health Scorecard", "💰 Valuation (DCF)"])
+    with tab_health:
+        render_analyzer_body(chosen)
+    with tab_val:
+        render_valuation_body(chosen)
+
+
+def render_analyzer_body(chosen: str) -> None:
+    """Plain-English five-pillar health scorecard for one ticker."""
     with st.spinner(f"Analyzing {chosen}…"):
         d = fetch_analyzer_data(chosen)
     if not d:
@@ -2012,19 +2022,10 @@ def render_stock_analyzer() -> None:
     )
 
 
-def render_valuation() -> None:
-    st.markdown(
-        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">'
-        '<h2 style="margin:0;">💰 Stock Valuation</h2>'
-        '<span style="color:#9ca3af;font-size:0.8rem;">5-year DCF · comps · sensitivity · Yahoo data</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption("Future cash flows → today's dollars → minus net debt → per share. "
-               "Adjust the assumptions to stress-test the fair value. Educational, not investment advice.")
-
-    # --- How to read this page (educational guide) -----------------------
-    with st.expander("📖 How to read this page — a guide to valuing a stock", expanded=False):
+def render_valuation_body(chosen: str) -> None:
+    """Full DCF valuation workbench for one ticker (called from the Analyzer page)."""
+    # --- How to read the valuation (educational guide) -------------------
+    with st.expander("📖 How to read the valuation — a guide to valuing a stock", expanded=False):
         st.markdown(
             """
 **The one question valuation answers:** *is this stock cheap, fair, or expensive relative to the cash it
@@ -2093,57 +2094,7 @@ A narrow range = robust thesis; a wild range = fragile.
             """
         )
 
-    # --- Market scope + ticker search -----------------------------------
-    VAL_MARKETS = {
-        "🌐 All": None,
-        "🇺🇸 USA": ["USA"],
-        "🇭🇰 Hong Kong": ["Hong Kong"],
-        "🇮🇳 India": ["India"],
-        "🇪🇺 Europe": ["Europe"],
-        "🌏 Asia": ["Asia (ex-HK/India)"],
-    }
-    val_market = st.radio(
-        "Market", options=list(VAL_MARKETS.keys()), horizontal=True,
-        key="val_market", label_visibility="collapsed",
-    )
-    market_keys = VAL_MARKETS[val_market]
-    placeholders = {
-        "🇺🇸 USA": "e.g. Apple, AAPL, Microsoft, NVDA…",
-        "🇭🇰 Hong Kong": "e.g. Tencent, 0700.HK, Alibaba, HSBC…",
-        "🇮🇳 India": "e.g. Reliance, TCS, INFY, HDFC Bank…",
-        "🇪🇺 Europe": "e.g. ASML, SAP, LVMH, Nestle…",
-        "🌏 Asia": "e.g. Toyota, 7203.T, Samsung, TSMC…",
-        "🌐 All": "e.g. Apple, Tencent, Reliance, Toyota…",
-    }
-
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        vq = st.text_input("🔎 Company name or ticker", key="val_search",
-                           placeholder=placeholders.get(val_market, ""))
-    chosen = None
-    if vq and len(vq.strip()) >= 2:
-        matches = fetch_symbol_search(vq, limit=25)
-        scoped_note = ""
-        if market_keys:
-            filt = [m for m in matches if _symbol_in_markets(m["symbol"], market_keys)]
-            if filt:
-                matches = filt
-            elif matches:
-                scoped_note = f" · no {val_market} match — showing all markets"
-        matches = matches[:10]
-        if matches:
-            opts = {f"{m['symbol']} — {m['name']}"
-                    + (f" · {m['exchange']}" if m.get("exchange") else ""): m["symbol"]
-                    for m in matches}
-            with c2:
-                pick = st.selectbox(f"Matches{scoped_note}", list(opts.keys()), key="val_pick")
-            chosen = opts.get(pick)
-        else:
-            chosen = vq.strip().upper()
-    if not chosen:
-        st.info(f"Pick a **{val_market}** market above, then search a company or ticker to value it.")
-        return
-
+    # --- Valuation for the chosen ticker (passed in from the Analyzer page) ---
     base = fetch_valuation_base(chosen)
     if not base:
         st.warning(
@@ -3157,7 +3108,7 @@ st.markdown(
 # stock pipeline below only executes when on the Stocks view.
 _active_view = st.radio(
     "View",
-    ["📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer", "💰 Stock Valuation"],
+    ["📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer"],
     horizontal=True,
     label_visibility="collapsed",
     key="active_view",
@@ -3167,9 +3118,6 @@ if _active_view == "🚀 Top Movers":
     st.stop()
 if _active_view == "🔬 Stock Analyzer":
     render_stock_analyzer()
-    st.stop()
-if _active_view == "💰 Stock Valuation":
-    render_valuation()
     st.stop()
 
 # ---- Sidebar -------------------------------------------------------------
