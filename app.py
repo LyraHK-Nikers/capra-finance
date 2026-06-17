@@ -975,6 +975,15 @@ def show_company_detail(ticker: str, display_name: str = "") -> None:
     exchange = info.get("fullExchangeName") or info.get("exchange", "—")
     st.caption(f"{sector} · {industry} · {exchange}")
 
+    # ---- Add-to-watchlist action ---------------------------------------
+    _wl_now = {str(s).upper() for s in st.session_state.get(WATCHLIST_KEY, [])}
+    wcol, _ = st.columns([1, 2])
+    if ticker.upper() in _wl_now:
+        wcol.button("✓ In your watchlist", disabled=True, use_container_width=True, key=f"wl_{ticker}")
+    else:
+        wcol.button("➕ Add to watchlist", use_container_width=True, key=f"wl_{ticker}",
+                    on_click=_add_ticker, args=(ticker, display_name))
+
     # ---- Top KPI strip --------------------------------------------------
     price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
     change_pct = info.get("regularMarketChangePercent")
