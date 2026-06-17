@@ -1261,7 +1261,9 @@ def fetch_region_movers(regions: tuple, direction: str, min_mcap: float, count: 
             time.sleep(0.6)
     # Post-filter on the returned marketCap to drop micro-cap stragglers
     # (some listings bypass the intradaymarketcap query filter).
-    clean = [q for q in quotes if (q.get("marketCap") or 0) >= min_mcap * 0.5]
+    # Keep rows the query already vetted; only drop ones that clearly undershoot the
+    # cap floor. (India etc. sometimes omit marketCap in the payload — don't discard those.)
+    clean = [q for q in quotes if q.get("marketCap") is None or q["marketCap"] >= min_mcap * 0.5]
     return clean[:count]
 
 
@@ -1352,6 +1354,43 @@ def _movers_dataframe(quotes: list[dict]) -> pd.DataFrame:
             "Market Cap": q.get("marketCap"),
             "Volume": q.get("regularMarketVolume") or q.get("averageDailyVolume3Month"),
             "52W %": q.get("fiftyTwoWeekChangePercent"),
+        })
+    return pd.DataFrame(rows)
+
+
+# Map the Top Movers market label → MARKET_PRESETS key (for the offline fallback).
+MOVER_TO_PRESET = {
+    "🇺🇸 USA": "USA", "🇭🇰 Hong Kong": "Hong Kong", "🇮🇳 India": "India",
+    "🇪🇺 Europe": "Europe", "🌏 Asia": "Asia (ex-HK/India)",
+}
+
+
+def _movers_from_presets(market_label: str) -> pd.DataFrame:
+    """Fallback movers built from the curated market universe via fetch_history
+    (which is far more reliable than the live screener). Guarantees a market always
+    shows gainers/losers even when Yahoo throttles the screener."""
+    universe = MARKET_PRESETS.get(MOVER_TO_PRESET.get(market_label, ""), {})
+    syms = tuple(universe.keys())
+    if not syms:
+        return pd.DataFrame()
+    hist = fetch_history(syms, period="5d")
+    vol = fetch_volume(syms, period="5d")
+    rows = []
+    for s in syms:
+        if hist.empty or s not in hist.columns:
+            continue
+        ser = hist[s].dropna()
+        if len(ser) < 2:
+            continue
+        last, prev = float(ser.iloc[-1]), float(ser.iloc[-2])
+        v = None
+        if not vol.empty and s in vol.columns:
+            vv = vol[s].dropna()
+            v = float(vv.iloc[-1]) if not vv.empty else None
+        rows.append({
+            "Symbol": s, "Company": universe.get(s, s), "Analyst Rating": "—",
+            "Price": last, "Change %": (last / prev - 1) * 100 if prev else 0.0,
+            "Change": last - prev, "Market Cap": None, "Volume": v, "52W %": None,
         })
     return pd.DataFrame(rows)
 
@@ -2626,16 +2665,33 @@ money is flowing *today*.
             losers = _movers_dataframe(fetch_region_movers(regions, "losers", mcap, 50))
             actives = _movers_dataframe(fetch_region_movers(regions, "active", mcap, 50))
 
+    # Resilience: if the live screener came back empty (Yahoo throttling), fall back
+    # to computing movers from this market's curated universe via fetch_history.
+    fallback_used = False
+    if gainers.empty and losers.empty:
+        with st.spinner(f"Live screener busy — building {market} movers from the curated list…"):
+            _fb = _movers_from_presets(market)
+        if not _fb.empty:
+            fallback_used = True
+            gainers = _fb.sort_values("Change %", ascending=False).head(50).reset_index(drop=True)
+            losers = _fb.sort_values("Change %", ascending=True).head(50).reset_index(drop=True)
+            actives = _fb.sort_values("Volume", ascending=False, na_position="last").head(50).reset_index(drop=True)
+
     if gainers.empty and losers.empty:
         st.warning(
-            f"⏳ Yahoo's screener didn't return {market} movers just now — usually temporary "
-            "rate-limiting, not an app problem. Wait a few seconds and click **Retry**."
+            f"⏳ Couldn't load {market} movers just now — Yahoo is rate-limiting both the live "
+            "screener and the price feed. Wait a few seconds and click **Retry**."
         )
         if st.button("🔄 Retry", key="movers_retry"):
             fetch_screener.clear()
             fetch_region_movers.clear()
+            fetch_history.clear()
             st.rerun()
         return
+
+    if fallback_used:
+        st.caption("⚠️ Live screener was busy, so these movers are computed from this market's "
+                   "curated large-cap list (analyst ratings & 52W show as “—” in this mode).")
 
     # KPI strip — company name as the headline, symbol + rating as context.
     k = st.columns(3)
