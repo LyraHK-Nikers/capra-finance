@@ -1588,6 +1588,430 @@ def _sensitivity_heatmap(base, a, mode: str):
     return fig
 
 
+# ---------------------------------------------------------------------------
+# Stock Analyzer page — plain-English, beginner-friendly health scorecard.
+# Implements the "Plain-English Stock Analyzer" spec: 5 pillars, green/amber/red
+# ratings with plain meanings + why-it-matters, a verdict, price chart, red flags.
+# ---------------------------------------------------------------------------
+
+# All rating thresholds live here in ONE place so they're easy to adjust later.
+# Tuple = (good_cutoff, okay_cutoff). See _an_rate for direction.
+ANALYZER_TH = {
+    "revenue_growth": (0.10, 0.0),    # higher better
+    "gross_margin": (0.40, 0.20),     # higher better
+    "net_margin": (0.15, 0.05),       # higher better
+    "roe": (0.15, 0.08),              # higher better
+    "debt_to_equity": (0.5, 1.5),     # LOWER better
+    "current_ratio": (1.5, 1.0),      # higher better
+    "pe": (15.0, 30.0),               # LOWER better
+    "peg": (1.0, 2.0),                # LOWER better
+}
+_AN_DOT = {"good": "🟢", "okay": "🟡", "bad": "🔴", "na": "⚪"}
+_AN_COLOR = {"good": "#10b981", "okay": "#eab308", "bad": "#ef4444", "na": "#6b7280"}
+_AN_SCORE = {"good": 2, "okay": 1, "bad": 0}
+
+
+def _an_rate(value, good, okay, lower_better=False) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "na"
+    if lower_better:
+        if value <= good:
+            return "good"
+        return "okay" if value <= okay else "bad"
+    if value >= good:
+        return "good"
+    return "okay" if value >= okay else "bad"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_analyzer_data(ticker: str) -> dict | None:
+    """Pull everything the plain-English analyzer needs (resilient to throttling)."""
+    info = fetch_info(ticker)
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    name = info.get("shortName") or info.get("longName")
+    if not price:
+        h = fetch_history((ticker,), period="5d")
+        if not h.empty and ticker in h.columns:
+            s = h[ticker].dropna()
+            if not s.empty:
+                price = float(s.iloc[-1])
+    if not price and not name:
+        return None
+
+    de = info.get("debtToEquity")
+    if de is not None and de > 5:   # yfinance reports D/E as a percent (e.g. 150 = 1.5)
+        de = de / 100.0
+
+    d = {
+        "name": name or ticker,
+        "sector": info.get("sector") or "—",
+        "industry": info.get("industry") or "",
+        "summary": info.get("longBusinessSummary") or "",
+        "price": price,
+        "currency": info.get("currency") or "USD",
+        "revenue_growth": info.get("revenueGrowth"),
+        "gross_margin": info.get("grossMargins"),
+        "net_margin": info.get("profitMargins"),
+        "roe": info.get("returnOnEquity"),
+        "eps": info.get("trailingEps"),
+        "debt_to_equity": de,
+        "current_ratio": info.get("currentRatio"),
+        "operating_cf": info.get("operatingCashflow"),
+        "fcf": info.get("freeCashflow"),
+        "net_income": info.get("netIncomeToCommon") or info.get("netIncome"),
+        "pe": info.get("trailingPE"),
+        "peg": info.get("trailingPegRatio") or info.get("pegRatio"),
+        "pb": info.get("priceToBook"),
+        "ev_ebitda": info.get("enterpriseToEbitda"),
+        "dividend_yield": info.get("dividendYield"),
+        "insider_pct": info.get("heldPercentInsiders"),
+    }
+
+    # Multi-year series (oldest -> newest) for trend-based red flags & quality.
+    rev_series, ni_series, fcf_series = [], [], []
+    try:
+        fin = fetch_financial_statements(ticker)
+        inc, cfs = fin.get("income"), fin.get("cashflow")
+
+        def _series(df, *names):
+            if df is None or getattr(df, "empty", True):
+                return []
+            for nm in names:
+                if nm in df.index:
+                    return [float(x) for x in df.loc[nm].values if x == x][::-1]
+            return []
+
+        rev_series = _series(inc, "Total Revenue", "Operating Revenue")
+        ni_series = _series(inc, "Net Income", "Net Income Common Stockholders")
+        fcf_series = _series(cfs, "Free Cash Flow")
+        if not fcf_series:
+            ocf = _series(cfs, "Operating Cash Flow", "Total Cash From Operating Activities")
+            capex = _series(cfs, "Capital Expenditure")
+            if ocf and capex and len(ocf) == len(capex):
+                fcf_series = [o + c for o, c in zip(ocf, capex)]  # capex is negative
+    except Exception:
+        pass
+    d["rev_series"], d["ni_series"], d["fcf_series"] = rev_series, ni_series, fcf_series
+    return d
+
+
+def _analyzer_rows(d: dict) -> dict:
+    """Build the rated, explained metric rows for each of the five pillars."""
+    rows: dict[str, list] = {}
+
+    def row(label, value, display, rating, meaning, why):
+        return {"label": label, "value": display, "rating": rating, "meaning": meaning, "why": why}
+
+    # ---- Profitability ----
+    rg = d["revenue_growth"]
+    gm = d["gross_margin"]
+    nm = d["net_margin"]
+    roe = d["roe"]
+    rows["Profitability"] = [
+        row("Revenue growth", rg, f"{rg*100:+.1f}%" if rg is not None else "N/A",
+            _an_rate(rg, *ANALYZER_TH["revenue_growth"]),
+            (f"Sales grew {rg*100:.1f}% versus a year ago." if (rg or 0) >= 0 else
+             f"Sales fell {abs(rg)*100:.1f}% versus a year ago.") if rg is not None else
+            "Yahoo didn't report revenue growth.",
+            "Growing sales are the engine of a healthy business — flat or falling sales make everything else harder."),
+        row("Gross margin", gm, f"{gm*100:.1f}%" if gm is not None else "N/A",
+            _an_rate(gm, *ANALYZER_TH["gross_margin"]),
+            f"After the direct cost of making its product, it keeps about {gm*100:.0f}¢ of every sales dollar." if gm is not None else "Not reported.",
+            "A fat gross margin leaves room to cover everything else and still profit; a thin one leaves little cushion."),
+        row("Net margin", nm, f"{nm*100:.1f}%" if nm is not None else "N/A",
+            _an_rate(nm, *ANALYZER_TH["net_margin"]),
+            f"For every $100 of sales, about ${nm*100:.0f} is kept as final profit." if nm is not None else "Not reported.",
+            "This is the true bottom line — what survives after all costs, interest, and tax."),
+        row("Return on equity", roe, f"{roe*100:.1f}%" if roe is not None else "N/A",
+            _an_rate(roe, *ANALYZER_TH["roe"]),
+            f"It turns each $1 of shareholders' money into about {roe*100:.0f}¢ of profit a year." if roe is not None else "Not reported.",
+            "Shows how efficiently the company uses the owners' money to make money."),
+    ]
+
+    # ---- Balance Sheet ----
+    de = d["debt_to_equity"]
+    cr = d["current_ratio"]
+    rows["Balance Sheet"] = [
+        row("Debt-to-equity", de, f"{de:.2f}" if de is not None else "N/A",
+            _an_rate(de, *ANALYZER_TH["debt_to_equity"], lower_better=True),
+            f"It owes about ${de:.2f} of debt for every $1 the owners have invested." if de is not None else "Not reported.",
+            "Too much debt is dangerous in a bad year; a lower ratio means a sturdier company."),
+        row("Current ratio", cr, f"{cr:.2f}" if cr is not None else "N/A",
+            _an_rate(cr, *ANALYZER_TH["current_ratio"]),
+            f"It has about ${cr:.2f} of short-term assets for every $1 of short-term bills." if cr is not None else "Not reported.",
+            "Below 1 means it might struggle to pay its near-term obligations."),
+    ]
+
+    # ---- Cash Flow ----
+    fcf = d["fcf"]
+    fcf_series = d["fcf_series"]
+    growing = len(fcf_series) >= 2 and fcf_series[-1] > fcf_series[0]
+    if fcf is None:
+        fcf_rating = "na"
+    elif fcf > 0:
+        fcf_rating = "good" if growing else "okay"
+    else:
+        fcf_rating = "bad"
+    ocf, ni = d["operating_cf"], d["net_income"]
+    cvp_ratio = (ocf / ni) if (ocf is not None and ni and ni > 0) else None
+    if cvp_ratio is None:
+        cvp_rating = "na"
+    elif cvp_ratio >= 0.9:
+        cvp_rating = "good"
+    else:
+        cvp_rating = "okay" if cvp_ratio >= 0.6 else "bad"
+    rows["Cash Flow"] = [
+        row("Free cash flow", fcf, _money(fcf) if fcf is not None else "N/A", fcf_rating,
+            (f"After running and investing in the business, it produced about {_money(fcf)} of spare cash"
+             + (" — and it's growing." if growing else ".")) if (fcf or 0) > 0 else
+            ("It spent more cash than it brought in (negative free cash flow)." if fcf is not None else "Not reported."),
+            "Cash — not paper profit — pays dividends, debt, and buybacks. Negative free cash flow means it relies on outside funding."),
+        row("Cash vs. profit", cvp_ratio, f"{cvp_ratio:.1f}×" if cvp_ratio is not None else "N/A", cvp_rating,
+            f"Its operating cash is about {cvp_ratio:.1f}× its reported profit." if cvp_ratio is not None else "Not enough data (needs positive profit).",
+            "Healthy profit should be backed by real cash; a big gap can signal aggressive accounting."),
+    ]
+
+    # ---- Valuation ----
+    pe = d["pe"]
+    peg = d["peg"]
+    pe_rating = "bad" if (pe is not None and pe < 0) else _an_rate(pe, *ANALYZER_TH["pe"], lower_better=True)
+    rows["Valuation"] = [
+        row("P/E ratio", pe, f"{pe:.1f}" if pe is not None else "N/A", pe_rating,
+            (f"You pay about ${pe:.1f} for every $1 of yearly profit." if (pe or 0) > 0 else
+             "The company isn't profitable on a trailing basis, so P/E doesn't apply.") if pe is not None else "Not reported.",
+            "A high P/E means high expectations — the company must keep growing to justify it. Always compare to peers."),
+        row("PEG ratio", peg, f"{peg:.2f}" if peg is not None else "N/A",
+            _an_rate(peg, *ANALYZER_TH["peg"], lower_better=True),
+            f"P/E adjusted for growth is about {peg:.2f}." if peg is not None else "Not reported.",
+            "Around 1 is often fair for the growth; well above 2 may be pricey."),
+        # Extra context rows (not rated — shown as info)
+        row("Price-to-book", d["pb"], f"{d['pb']:.2f}" if d["pb"] is not None else "N/A", "na",
+            f"The price is about {d['pb']:.2f}× the company's net book value." if d["pb"] is not None else "Not reported.",
+            "Context only — useful mainly for asset-heavy businesses like banks."),
+        row("EV/EBITDA", d["ev_ebitda"], f"{d['ev_ebitda']:.1f}" if d["ev_ebitda"] is not None else "N/A", "na",
+            f"Enterprise value is about {d['ev_ebitda']:.1f}× core operating earnings." if d["ev_ebitda"] is not None else "Not reported.",
+            "Context only — a capital-structure-neutral valuation multiple."),
+    ]
+
+    # ---- Quality ----
+    quality = []
+    # Margin stability from net-margin history
+    nm_series = []
+    if d["rev_series"] and d["ni_series"] and len(d["rev_series"]) == len(d["ni_series"]):
+        nm_series = [n / r for n, r in zip(d["ni_series"], d["rev_series"]) if r]
+    if len(nm_series) >= 3:
+        spread = max(nm_series) - min(nm_series)
+        ms_rating = "good" if spread <= 0.05 else ("okay" if spread <= 0.12 else "bad")
+        quality.append(row("Margin stability", spread, f"{min(nm_series)*100:.0f}–{max(nm_series)*100:.0f}%", ms_rating,
+            f"Over the last {len(nm_series)} years, net margin ranged {min(nm_series)*100:.0f}% to {max(nm_series)*100:.0f}%.",
+            "Consistent margins suggest a durable, well-run business; wild swings suggest fragility."))
+    else:
+        quality.append(row("Margin stability", None, "N/A", "na",
+            "Not enough multi-year data to judge consistency.",
+            "Consistency over years beats one strong quarter."))
+    # Insider ownership
+    ins = d["insider_pct"]
+    ins_rating = "na" if ins is None else ("good" if ins >= 0.05 else ("okay" if ins >= 0.01 else "na"))
+    quality.append(row("Insider ownership", ins, f"{ins*100:.1f}%" if ins is not None else "N/A", ins_rating,
+        f"Insiders own about {ins*100:.1f}% of the company." if ins is not None else "Not reported.",
+        "Meaningful insider ownership means management's own money is on the line alongside yours."))
+    # Qualitative moat note
+    quality.append(row("Competitive moat", None, "Research", "na",
+        "A durable advantage — brand, scale, network effects, or switching costs — can't be read from the numbers alone.",
+        "The strongest businesses defend their profits for years; judge this qualitatively from how the company competes."))
+    rows["Quality"] = quality
+
+    return rows
+
+
+def _analyzer_red_flags(d: dict) -> list[str]:
+    flags = []
+    rev, fcf, ni = d["rev_series"], d["fcf_series"], d["ni_series"]
+    if len(rev) >= 2 and len(fcf) >= 2 and rev[-1] > rev[0] and fcf[-1] < fcf[0]:
+        flags.append("**Revenue is rising but free cash flow is falling** — growth may not be turning into real cash.")
+    if d["debt_to_equity"] is not None and d["debt_to_equity"] > 1.5:
+        flags.append(f"**High debt load** (debt-to-equity {d['debt_to_equity']:.2f}, above 1.5) — risky if the business slows.")
+    if len(rev) >= 3 and len(ni) >= 3 and len(rev) == len(ni):
+        nm_series = [n / r for n, r in zip(ni, rev) if r]
+        if len(nm_series) >= 3 and nm_series[-1] < nm_series[0] - 0.02:
+            flags.append("**Net margin has been shrinking** over the last few years — the business is becoming less profitable.")
+    if d["pe"] is not None and d["pe"] > 30:
+        flags.append(f"**P/E is high** ({d['pe']:.0f}) — the price may have run ahead of fundamentals; compare it against sector peers.")
+    if d["net_income"] and d["net_income"] > 0 and d["operating_cf"] is not None and d["operating_cf"] < 0.7 * d["net_income"]:
+        flags.append("**Reported profit isn't fully backed by operating cash** — a classic accounting warning sign.")
+    return flags
+
+
+def render_stock_analyzer() -> None:
+    st.markdown(
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">'
+        '<h2 style="margin:0;">🔬 Stock Analyzer</h2>'
+        '<span style="color:#9ca3af;font-size:0.8rem;">Plain-English health scorecard · Yahoo data</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Type a ticker and get a beginner-friendly verdict: five health pillars, each metric rated "
+               "🟢 good / 🟡 okay / 🔴 watch with what it means and why it matters. Educational, not advice.")
+
+    AN_MARKETS = {
+        "🌐 All": None, "🇺🇸 USA": ["USA"], "🇭🇰 Hong Kong": ["Hong Kong"],
+        "🇮🇳 India": ["India"], "🇪🇺 Europe": ["Europe"], "🌏 Asia": ["Asia (ex-HK/India)"],
+    }
+    an_market = st.radio("Market", options=list(AN_MARKETS.keys()), horizontal=True,
+                         key="an_market", label_visibility="collapsed")
+    market_keys = AN_MARKETS[an_market]
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        q = st.text_input("🔎 Company name or ticker", key="an_search",
+                          placeholder="e.g. Apple, AAPL, Tencent, Reliance…")
+    chosen = None
+    if q and len(q.strip()) >= 2:
+        matches = fetch_symbol_search(q, limit=25)
+        if market_keys:
+            filt = [m for m in matches if _symbol_in_markets(m["symbol"], market_keys)]
+            matches = filt or matches
+        matches = matches[:10]
+        if matches:
+            opts = {f"{m['symbol']} — {m['name']}" + (f" · {m['exchange']}" if m.get("exchange") else ""): m["symbol"] for m in matches}
+            with c2:
+                pick = st.selectbox("Matches", list(opts.keys()), key="an_pick")
+            chosen = opts.get(pick)
+        else:
+            chosen = q.strip().upper()
+    if not chosen:
+        st.info("Search a company or enter a ticker above to analyze it.")
+        return
+
+    with st.spinner(f"Analyzing {chosen}…"):
+        d = fetch_analyzer_data(chosen)
+    if not d:
+        st.warning(f"⏳ Couldn't load data for **{chosen}** — usually temporary Yahoo rate-limiting. Wait a few seconds and click Retry.")
+        if st.button("🔄 Retry", key="an_retry"):
+            fetch_analyzer_data.clear()
+            st.rerun()
+        return
+
+    sections = _analyzer_rows(d)
+
+    # ---- Category scores (aggregate of rated metrics) ----
+    cat_rating = {}
+    for cat, rws in sections.items():
+        scored = [_AN_SCORE[r["rating"]] for r in rws if r["rating"] in _AN_SCORE]
+        if not scored:
+            cat_rating[cat] = "na"
+        else:
+            avg = sum(scored) / len(scored)
+            cat_rating[cat] = "good" if avg >= 1.5 else ("okay" if avg >= 0.75 else "bad")
+    greens = sum(1 for v in cat_rating.values() if v == "good")
+    reds = sum(1 for v in cat_rating.values() if v == "bad")
+
+    # ---- Plain-English verdict ----
+    if greens >= 4 and reds == 0:
+        head = f"**{d['name']}** looks financially strong."
+    elif greens >= reds and reds <= 1:
+        head = f"**{d['name']}** looks reasonably healthy, with a few things to watch."
+    elif reds >= 3:
+        head = f"**{d['name']}** shows several warning signs — dig in carefully."
+    else:
+        head = f"**{d['name']}** is a mixed picture."
+    green_cats = [c for c, v in cat_rating.items() if v == "good"]
+    red_cats = [c for c, v in cat_rating.items() if v == "bad"]
+    bits = [head, f"{greens} of 5 areas scored green and {reds} scored red."]
+    if green_cats:
+        bits.append(f"Strengths: {', '.join(green_cats)}.")
+    if red_cats:
+        bits.append(f"Watch: {', '.join(red_cats)}.")
+    bits.append("These are simple rules of thumb — compare against similar companies, and remember this is educational, not advice.")
+    st.markdown(
+        '<div class="gt-card" style="border-left:3px solid #ff6b35;">'
+        '<div style="font-size:0.72rem;color:#ff9a5c;text-transform:uppercase;letter-spacing:0.06em;font-family:\'JetBrains Mono\',monospace;margin-bottom:6px;">Plain-English Verdict</div>'
+        f'<div style="font-size:0.95rem;color:#e5e7eb;line-height:1.5;">{" ".join(bits)}</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ---- Company overview ----
+    oc = st.columns([3, 1])
+    with oc[0]:
+        st.markdown(f"#### {chosen} · {d['name']}")
+        sub = d["summary"][:340] + ("…" if len(d["summary"]) > 340 else "") if d["summary"] else "No description available."
+        st.caption(f"{d['sector']}{(' · ' + d['industry']) if d['industry'] else ''}")
+        st.markdown(f"<span style='color:#cbd5e1;font-size:0.85rem;'>{sub}</span>", unsafe_allow_html=True)
+    with oc[1]:
+        st.metric("Share price", f"{d['price']:,.2f}" if d["price"] else "—", help=d["currency"])
+
+    # ---- Health scorecard ----
+    st.markdown("##### Health Scorecard")
+    sc = st.columns(5)
+    for col, cat in zip(sc, ["Profitability", "Balance Sheet", "Cash Flow", "Valuation", "Quality"]):
+        r = cat_rating[cat]
+        col.markdown(
+            f'<div class="gt-card" style="text-align:center;border-top:3px solid {_AN_COLOR[r]};">'
+            f'<div style="font-size:1.8rem;line-height:1;">{_AN_DOT[r]}</div>'
+            f'<div style="font-size:0.72rem;color:#cbd5e1;margin-top:6px;font-family:\'JetBrains Mono\',monospace;">{cat}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ---- Detail sections ----
+    st.markdown("##### Details")
+    for cat in ["Profitability", "Balance Sheet", "Cash Flow", "Valuation", "Quality"]:
+        with st.expander(f"{_AN_DOT[cat_rating[cat]]}  {cat}", expanded=(cat == "Profitability")):
+            for r in sections[cat]:
+                st.markdown(
+                    f"{_AN_DOT[r['rating']]} **{r['label']} — {r['value']}**  \n"
+                    f"{r['meaning']}  \n"
+                    f"<span style='color:#94a3b8;font-size:0.82rem;'>Why it matters: {r['why']}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
+
+    # ---- Price chart (12 months + 50 & 200-day moving averages) ----
+    st.markdown("##### Price & Trend (12 months, with 50 & 200-day averages)")
+    hist = fetch_history((chosen,), period="2y")
+    if not hist.empty and chosen in hist.columns:
+        s = hist[chosen].dropna()
+        if len(s) >= 30:
+            ma50 = s.rolling(50).mean()
+            ma200 = s.rolling(200).mean()
+            tail = s.index[-252:] if len(s) > 252 else s.index
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=tail, y=s.reindex(tail), name="Price",
+                                     line=dict(color="#ff6b35", width=2)))
+            fig.add_trace(go.Scatter(x=tail, y=ma50.reindex(tail), name="50-day avg",
+                                     line=dict(color="#f7931e", width=1, dash="dot")))
+            fig.add_trace(go.Scatter(x=tail, y=ma200.reindex(tail), name="200-day avg",
+                                     line=dict(color="#9ca3af", width=1, dash="dash")))
+            fig.update_layout(height=360, margin=dict(t=10, l=10, r=10, b=10),
+                              template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                              font=dict(family="Inter, sans-serif", color="#cbd5e1"),
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                              yaxis=dict(gridcolor="rgba(255,255,255,0.05)"))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("When the price is above both averages and the 50-day is above the 200-day, the trend is generally up.")
+        else:
+            st.caption("Not enough price history to chart.")
+    else:
+        st.caption("Price history unavailable right now.")
+
+    # ---- Red-flag detector ----
+    st.markdown("##### 🚩 Red-Flag Detector")
+    flags = _analyzer_red_flags(d)
+    if flags:
+        for f in flags:
+            st.markdown(f"⚠️ {f}")
+    else:
+        st.success("✅ No major red flags detected in the patterns we check.")
+
+    st.divider()
+    st.caption(
+        "Educational tool — not financial, investment, or trading advice. Ratings are simplified rules of "
+        "thumb that vary by industry and context. Free data can be delayed or incomplete; verify key numbers "
+        "against official company filings before any real decision."
+    )
+
+
 def render_valuation() -> None:
     st.markdown(
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">'
@@ -2733,13 +3157,16 @@ st.markdown(
 # stock pipeline below only executes when on the Stocks view.
 _active_view = st.radio(
     "View",
-    ["📈 Global Stocks", "🚀 Top Movers", "💰 Stock Valuation"],
+    ["📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer", "💰 Stock Valuation"],
     horizontal=True,
     label_visibility="collapsed",
     key="active_view",
 )
 if _active_view == "🚀 Top Movers":
     render_top_movers()
+    st.stop()
+if _active_view == "🔬 Stock Analyzer":
+    render_stock_analyzer()
     st.stop()
 if _active_view == "💰 Stock Valuation":
     render_valuation()
