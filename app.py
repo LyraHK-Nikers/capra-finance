@@ -3193,11 +3193,12 @@ st.markdown(
 
 # ---------------------------------------------------------------------------
 # Cinematic intro — Nolan-style logo reveal, plays once per browser session.
-# A CSS-driven full-screen overlay renders, then the server sleeps while it
-# animates, then reruns into the app. (Audio can't autoplay in browsers, so the
-# drama is purely visual: slow fades, monumental type, a single violet accent.)
+# NON-BLOCKING: the overlay is a fixed, top-z-index layer that the app renders
+# BEHIND in the same run, and a pure-CSS animation fades it out after ~3s. So the
+# intro overlaps data loading instead of adding to it — no server sleep, no rerun.
 # ---------------------------------------------------------------------------
 if not st.session_state.get("_intro_done"):
+    st.session_state["_intro_done"] = True  # one-shot; app loads behind the overlay
     _intro_logo = (
         f'<img class="logo" src="{_LOGO_DATA_URI}"/>' if _LOGO_DATA_URI
         else '<div class="logo" style="display:flex;align-items:center;justify-content:center;'
@@ -3205,38 +3206,36 @@ if not st.session_state.get("_intro_done"):
     )
     st.markdown(
         "<style>"
-        '[data-testid="stHeader"]{display:none!important;}'
-        ".stApp{background:#000!important;}"
         "#capra-intro{position:fixed;inset:0;z-index:2147483000;background:#000;display:flex;"
         "flex-direction:column;align-items:center;justify-content:center;overflow:hidden;"
-        "font-family:'Big Shoulders Display','Inter',sans-serif;animation:introOut .7s ease 4.8s forwards;}"
+        "font-family:'Big Shoulders Display','Inter',sans-serif;animation:introOut .6s ease 3.0s forwards;}"
         "#capra-intro .vignette{position:absolute;inset:0;background:"
         "radial-gradient(circle at 50% 44%,rgba(255,107,53,.12),rgba(0,0,0,0) 55%),"
         "radial-gradient(circle at 50% 50%,rgba(0,0,0,0) 38%,#000 100%);pointer-events:none;}"
         "#capra-intro .logo{width:138px;height:138px;border-radius:26px;background:#fff;opacity:0;"
-        "transform:scale(.7);animation:logoIn 1.6s cubic-bezier(.2,.7,.2,1) .3s forwards,"
-        "logoGlow 2.4s ease 1.4s forwards;}"
+        "transform:scale(.7);animation:logoIn 1.1s cubic-bezier(.2,.7,.2,1) .15s forwards,"
+        "logoGlow 1.8s ease .9s forwards;}"
         "#capra-intro .line{width:0;height:1px;margin-top:32px;"
         "background:linear-gradient(90deg,transparent,#ff6b35,transparent);"
-        "animation:lineGrow 1.4s ease 1.2s forwards;}"
+        "animation:lineGrow 1.0s ease .8s forwards;}"
         "#capra-intro .word{margin-top:28px;font-weight:900;font-size:clamp(3rem,9vw,6.4rem);"
         "color:#fff;letter-spacing:.04em;text-transform:uppercase;text-align:center;line-height:.92;opacity:0;"
-        "animation:wordIn 1.4s ease 1.9s forwards;}"
+        "animation:wordIn 1.0s ease 1.1s forwards;}"
         "#capra-intro .word .sub{display:block;font-size:.26em;font-weight:700;letter-spacing:.5em;"
-        "color:#ff9a5c;margin-top:10px;opacity:0;animation:wordIn 1.2s ease 2.6s forwards;}"
+        "color:#ff9a5c;margin-top:10px;opacity:0;animation:wordIn .8s ease 1.6s forwards;}"
         "#capra-intro .tag{margin-top:26px;font-size:.72rem;font-weight:500;letter-spacing:.42em;"
         "font-family:'JetBrains Mono',monospace;color:#64748b;text-transform:uppercase;opacity:0;"
-        "animation:wordIn 1.2s ease 3.2s forwards;}"
+        "animation:wordIn .8s ease 2.0s forwards;}"
         "#capra-intro .timebar{position:absolute;bottom:0;left:0;height:2px;width:0;"
         "background:linear-gradient(90deg,#f7931e,#ff9a5c);box-shadow:0 0 14px #ff6b35;"
-        "animation:timeFill 4.8s linear .2s forwards;}"
+        "animation:timeFill 3.0s linear .1s forwards;}"
         "@keyframes logoIn{to{opacity:1;transform:scale(1);}}"
         "@keyframes logoGlow{0%{box-shadow:0 0 0 rgba(255,107,53,0);}"
         "50%{box-shadow:0 0 72px rgba(255,107,53,.55);}100%{box-shadow:0 0 38px rgba(255,107,53,.30);}}"
         "@keyframes lineGrow{to{width:min(440px,72vw);}}"
         "@keyframes wordIn{to{opacity:1;}}"
         "@keyframes timeFill{to{width:100%;}}"
-        "@keyframes introOut{to{opacity:0;visibility:hidden;}}"
+        "@keyframes introOut{to{opacity:0;visibility:hidden;pointer-events:none;}}"
         "</style>"
         '<div id="capra-intro"><div class="vignette"></div>'
         f"{_intro_logo}"
@@ -3246,9 +3245,6 @@ if not st.session_state.get("_intro_done"):
         '<div class="timebar"></div></div>',
         unsafe_allow_html=True,
     )
-    time.sleep(5.6)
-    st.session_state["_intro_done"] = True
-    st.rerun()
 
 # Persistent user state (portfolio + alerts). Loaded from JSON on disk.
 if "user_state" not in st.session_state:
