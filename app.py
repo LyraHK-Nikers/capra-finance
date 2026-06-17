@@ -957,7 +957,9 @@ def _add_tickers_bulk(symbols: list[str]) -> None:
         if s not in custom:
             custom.append(s)
     st.session_state[WATCHLIST_KEY] = wl
-    st.session_state["movers_to_watchlist"] = []  # reset the picker after adding
+    for _k in ("movers_to_watchlist", "suggested_to_watchlist"):  # reset pickers after adding
+        if _k in st.session_state:
+            st.session_state[_k] = []
 
 
 @st.dialog("📊 Company Details", width="large")
@@ -1208,11 +1210,11 @@ def _render_event_card(event: dict) -> None:
 # screeners; other markets use region-filtered EquityQuery screens with a market-cap
 # floor to keep out illiquid micro-cap noise.
 MOVER_MARKETS: dict[str, dict] = {
-    "🇺🇸 USA": {"mode": "predefined"},
+    "🇺🇸 USA": {"mode": "predefined", "regions": ["us"], "min_mcap": 1e9},
     "🇭🇰 Hong Kong": {"mode": "region", "regions": ["hk"], "min_mcap": 1e9},
     "🇮🇳 India": {"mode": "region", "regions": ["in"], "min_mcap": 1e9},
-    "🇪🇺 Europe": {"mode": "region", "regions": ["gb", "de", "fr", "it", "es", "nl", "ch", "se"], "min_mcap": 1e9},
-    "🌏 Asia": {"mode": "region", "regions": ["jp", "kr", "tw", "sg", "hk"], "min_mcap": 1e9},
+    "🇪🇺 Europe": {"mode": "region", "regions": ["de", "fr", "nl", "ch", "gb", "it", "es", "se"], "min_mcap": 1e9},
+    "🌏 Asia": {"mode": "region", "regions": ["jp", "kr", "tw", "hk", "sg"], "min_mcap": 1e9},
 }
 
 
@@ -1261,6 +1263,51 @@ def fetch_region_movers(regions: tuple, direction: str, min_mcap: float, count: 
     # (some listings bypass the intradaymarketcap query filter).
     clean = [q for q in quotes if (q.get("marketCap") or 0) >= min_mcap * 0.5]
     return clean[:count]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_suggested_buys(regions: tuple, min_mcap: float = 2e9, count: int = 12) -> list[dict]:
+    """Larger, liquid companies that Wall-Street analysts currently rate Buy or
+    Strong Buy (consensus ≤ 2.2), ranked best-rated first. Queries each region
+    SEPARATELY — a multi-region query returns junk consolidated tickers without
+    ratings — then merges. Uses only the screener payload, so it's cheap."""
+    from yfinance import EquityQuery
+    pool = []
+    for reg in list(regions)[:6]:  # cap calls; cfg lists strongest-coverage regions first
+        q = EquityQuery("and", [
+            EquityQuery("eq", ["region", reg]),
+            EquityQuery("gt", ["intradaymarketcap", min_mcap]),
+            EquityQuery("gt", ["dayvolume", 200000]),
+        ])
+        for i in range(2):
+            try:
+                res = yf.screen(q, sortField="intradaymarketcap", sortAsc=False, count=50)
+                quotes = res.get("quotes", []) if isinstance(res, dict) else []
+            except Exception:
+                quotes = []
+            if quotes:
+                pool.extend(quotes)
+                break
+            if i == 0:
+                time.sleep(0.4)
+    seen, scored = set(), []
+    for x in pool:
+        sym = x.get("symbol")
+        rs = x.get("averageAnalystRating")
+        if not sym or sym in seen or not isinstance(rs, str):
+            continue
+        try:
+            rnum = float(rs.split(" - ")[0])
+        except Exception:
+            continue
+        if rnum > 2.2 or (x.get("marketCap") or 0) < min_mcap * 0.5:
+            continue
+        seen.add(sym)
+        x["_rating_num"] = rnum
+        scored.append(x)
+    # Best consensus first; break ties with larger, more established companies.
+    scored.sort(key=lambda x: (x["_rating_num"], -(x.get("marketCap") or 0)))
+    return scored[:count]
 
 
 def _row_click_symbol(event, df: pd.DataFrame, state_key: str) -> str | None:
@@ -2616,6 +2663,37 @@ money is flowing *today*.
         "52W %": st.column_config.NumberColumn(format="%+.1f"),
     }
 
+    # --- 💡 Suggested Buys for the selected market ----------------------
+    st.markdown(f"##### 💡 Suggested Buys in {market}")
+    st.caption("Larger, liquid companies that Wall-Street analysts currently rate **Buy or Strong Buy** "
+               "(consensus ≤ 2.2), best-rated first. A research starting point — **not** a recommendation.")
+    _sb_regions = tuple(cfg.get("regions", ["us"]))
+    suggested = _movers_dataframe(fetch_suggested_buys(_sb_regions, 2e9, 12))
+    sb_ev = None
+    if suggested.empty:
+        st.caption("No analyst-rated buy candidates came back for this market right now "
+                   "(coverage varies by region, and Yahoo may be throttling). Try again shortly.")
+    else:
+        sb_ev = st.dataframe(
+            suggested, use_container_width=True, hide_index=True, height=300,
+            column_config=_mover_col_config, on_select="rerun",
+            selection_mode="single-row", key="tbl_suggested",
+        )
+        _in_wl_sb = set(st.session_state.get(WATCHLIST_KEY, []))
+        _sb_addable = [s for s in suggested["Symbol"] if s not in _in_wl_sb]
+        sbc1, sbc2 = st.columns([3, 1])
+        _sbpicks = sbc1.multiselect(
+            "Add suggested buys to your watchlist", options=_sb_addable,
+            key="suggested_to_watchlist", label_visibility="collapsed",
+            placeholder="Pick suggested buys to add to your watchlist…",
+        )
+        sbc2.button(
+            f"➕ Add {len(_sbpicks)}" if _sbpicks else "➕ Add",
+            use_container_width=True, disabled=not _sbpicks,
+            on_click=_add_tickers_bulk, args=(_sbpicks,), key="sb_add_btn",
+        )
+
+    st.divider()
     st.caption("👆 **Click any row** to open that company's full analysis (chart, financials, ratios, news).")
 
     g_col, l_col = st.columns(2)
@@ -2656,10 +2734,11 @@ money is flowing *today*.
             st.caption("No data.")
 
     # Open the detail dialog for whichever table's row was just clicked.
+    _sym_s = _row_click_symbol(sb_ev, suggested, "_sel_suggested") if sb_ev is not None else None
     _sym_g = _row_click_symbol(g_ev, gainers, "_sel_gainers")
     _sym_l = _row_click_symbol(l_ev, losers, "_sel_losers")
     _sym_a = _row_click_symbol(a_ev, actives, "_sel_actives") if a_ev is not None else None
-    _clicked = _sym_g or _sym_l or _sym_a
+    _clicked = _sym_s or _sym_g or _sym_l or _sym_a
     if _clicked:
         show_company_detail(_clicked)
 
