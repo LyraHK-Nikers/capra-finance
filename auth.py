@@ -20,6 +20,7 @@ import hmac
 import json
 import secrets as _secrets
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -112,6 +113,22 @@ def get_user(email: str):
         return None
 
 
+def _explain_db_error(exc) -> str:
+    """Map a request failure to a short cause the UI can turn into advice."""
+    if isinstance(exc, urllib.error.HTTPError):
+        code = getattr(exc, "code", 0)
+        if code in (401, 403):
+            return "auth"        # bad/missing key, or RLS blocking
+        if code == 404:
+            return "table"       # users table missing / wrong URL path
+        if code == 409:
+            return "duplicate"   # unique email constraint
+        return "http"
+    if isinstance(exc, urllib.error.URLError):
+        return "unreachable"     # DNS/connection — usually a wrong SUPABASE_URL
+    return "unknown"
+
+
 def create_user(email: str, pw: str, full_name: str):
     email = email.lower()
     is_super = bool(email) and email == _superadmin_email()
@@ -122,8 +139,12 @@ def create_user(email: str, pw: str, full_name: str):
         "role": "superadmin" if is_super else "user",
         "status": "approved" if is_super else "pending",
     }
-    res = _req("POST", "users", body=row)
-    return res[0] if res else None
+    try:
+        res = _req("POST", "users", body=row)
+        return res[0] if res else None
+    except Exception as exc:
+        st.session_state["_auth_db_error"] = _explain_db_error(exc)
+        return None
 
 
 def list_users():
@@ -134,11 +155,17 @@ def list_users():
 
 
 def update_user(uid, fields: dict):
-    return _req("PATCH", "users", body=fields, params={"id": f"eq.{uid}"})
+    try:
+        return _req("PATCH", "users", body=fields, params={"id": f"eq.{uid}"})
+    except Exception:
+        return None
 
 
 def delete_user(uid):
-    return _req("DELETE", "users", params={"id": f"eq.{uid}"})
+    try:
+        return _req("DELETE", "users", params={"id": f"eq.{uid}"})
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -271,9 +298,24 @@ def _auth_screen() -> None:
                     elif get_user(email2):
                         st.error("An account with that email already exists.")
                     else:
+                        st.session_state.pop("_auth_db_error", None)
                         u = create_user(email2, pw1, name)
                         if not u:
-                            st.error("Couldn't create the account (database error). Try again shortly.")
+                            kind = st.session_state.get("_auth_db_error")
+                            if kind == "unreachable":
+                                st.error("Can't reach Supabase. Double-check the **SUPABASE_URL** secret — "
+                                         "it should look like `https://xxxx.supabase.co` (your real project ref, "
+                                         "not the placeholder), with no trailing path.")
+                            elif kind == "auth":
+                                st.error("Supabase rejected the request. Check **SUPABASE_KEY** — it must be the "
+                                         "**service_role** secret key (not the `anon` public key).")
+                            elif kind == "table":
+                                st.error("The `users` table wasn't found. Run the setup SQL in the Supabase "
+                                         "SQL editor, then try again.")
+                            elif kind == "duplicate":
+                                st.error("An account with that email already exists.")
+                            else:
+                                st.error("Couldn't create the account (database error). Try again shortly.")
                         elif u.get("status") == "approved":
                             st.session_state["_auth_user"] = u
                             _set_cookie(u["email"])  # remember me (super-admin auto-approved)
