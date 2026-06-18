@@ -129,6 +129,20 @@ def _explain_db_error(exc) -> str:
     return "unknown"
 
 
+def _error_detail(exc) -> str:
+    """Best-effort human detail (status + PostgREST body) to debug setup errors."""
+    try:
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                body = exc.read().decode(errors="replace")
+            except Exception:
+                body = ""
+            return f"HTTP {exc.code} — {body[:400]}".strip()
+        return f"{type(exc).__name__}: {exc}"[:400]
+    except Exception:
+        return type(exc).__name__
+
+
 def create_user(email: str, pw: str, full_name: str):
     email = email.lower()
     is_super = bool(email) and email == _superadmin_email()
@@ -141,9 +155,17 @@ def create_user(email: str, pw: str, full_name: str):
     }
     try:
         res = _req("POST", "users", body=row)
-        return res[0] if res else None
+        if res:
+            return res[0]
+        st.session_state["_auth_db_error"] = "empty"
+        st.session_state["_auth_db_detail"] = (
+            "Supabase accepted the request but returned no row — the insert may have "
+            "failed silently, or row representation is turned off."
+        )
+        return None
     except Exception as exc:
         st.session_state["_auth_db_error"] = _explain_db_error(exc)
+        st.session_state["_auth_db_detail"] = _error_detail(exc)
         return None
 
 
@@ -299,9 +321,11 @@ def _auth_screen() -> None:
                         st.error("An account with that email already exists.")
                     else:
                         st.session_state.pop("_auth_db_error", None)
+                        st.session_state.pop("_auth_db_detail", None)
                         u = create_user(email2, pw1, name)
                         if not u:
                             kind = st.session_state.get("_auth_db_error")
+                            detail = st.session_state.get("_auth_db_detail", "")
                             if kind == "unreachable":
                                 st.error("Can't reach Supabase. Double-check the **SUPABASE_URL** secret — "
                                          "it should look like `https://xxxx.supabase.co` (your real project ref, "
@@ -316,6 +340,8 @@ def _auth_screen() -> None:
                                 st.error("An account with that email already exists.")
                             else:
                                 st.error("Couldn't create the account (database error). Try again shortly.")
+                            if detail:
+                                st.caption(f"🔎 Technical detail (for setup): {detail}")
                         elif u.get("status") == "approved":
                             st.session_state["_auth_user"] = u
                             _set_cookie(u["email"])  # remember me (super-admin auto-approved)
