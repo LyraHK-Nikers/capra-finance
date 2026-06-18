@@ -11,6 +11,11 @@ Design notes
 - New sign-ups land as role='user', status='pending'. The email in SUPERADMIN_EMAIL
   is auto-promoted to role='superadmin', status='approved' on registration so the
   owner can bootstrap and then approve everyone else.
+- Optional email confirmation: when RESEND_API_KEY + APP_URL are set, sign-up emails
+  a signed confirmation link (via Resend); users must click it (email_verified=true)
+  AND be approved before they can log in. The super-admin is always exempt. With those
+  secrets absent, the email step is skipped entirely and nothing changes.
+  Requires a `email_verified boolean not null default false` column on `users`.
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ import streamlit as st
 ROLE_RANK = {"user": 0, "admin": 1, "superadmin": 2}
 COOKIE_NAME = "capra_auth"
 COOKIE_DAYS = 30
+VERIFY_DAYS = 3  # how long an email-confirmation link stays valid
 
 
 # --------------------------------------------------------------------------
@@ -64,6 +70,29 @@ def _cookie_secret() -> str:
     SUPABASE_KEY when COOKIE_SECRET isn't set, so existing setups keep working.
     """
     return _secret("COOKIE_SECRET") or _cfg()[1]
+
+
+# --------------------------------------------------------------------------
+# Email config (Resend) — verification emails are sent ONLY when configured.
+# --------------------------------------------------------------------------
+def _app_url() -> str:
+    """Public base URL of the app, used to build the confirmation link."""
+    return _secret("APP_URL").rstrip("/")
+
+
+def _mail_from() -> str:
+    """The From address. Defaults to Resend's test sender until a domain is verified."""
+    return _secret("MAIL_FROM") or "CAPRA Finance <onboarding@resend.dev>"
+
+
+def email_configured() -> bool:
+    """True only when we can actually send a working confirmation link.
+
+    Requires a Resend API key AND a public APP_URL (the link target). When this is
+    False the app behaves exactly as before — no email step — so partial setup
+    never locks anyone out.
+    """
+    return bool(_secret("RESEND_API_KEY") and _app_url())
 
 
 # --------------------------------------------------------------------------
@@ -143,16 +172,8 @@ def _error_detail(exc) -> str:
         return type(exc).__name__
 
 
-def create_user(email: str, pw: str, full_name: str):
-    email = email.lower()
-    is_super = bool(email) and email == _superadmin_email()
-    row = {
-        "email": email,
-        "password_hash": hash_password(pw),
-        "full_name": full_name or email.split("@")[0],
-        "role": "superadmin" if is_super else "user",
-        "status": "approved" if is_super else "pending",
-    }
+def _insert_user(row: dict):
+    """POST one user row; return the created row, or None (recording error detail)."""
     try:
         res = _req("POST", "users", body=row)
         if res:
@@ -167,6 +188,40 @@ def create_user(email: str, pw: str, full_name: str):
         st.session_state["_auth_db_error"] = _explain_db_error(exc)
         st.session_state["_auth_db_detail"] = _error_detail(exc)
         return None
+
+
+def create_user(email: str, pw: str, full_name: str):
+    email = email.lower()
+    is_super = bool(email) and email == _superadmin_email()
+    row = {
+        "email": email,
+        "password_hash": hash_password(pw),
+        "full_name": full_name or email.split("@")[0],
+        "role": "superadmin" if is_super else "user",
+        "status": "approved" if is_super else "pending",
+        # Super-admin and (until email is configured) everyone are auto-verified.
+        "email_verified": bool(is_super or not email_configured()),
+    }
+    u = _insert_user(row)
+    # Graceful path if the table hasn't had the email_verified column added yet:
+    # retry the insert without it so sign-up never breaks pre-migration.
+    if u is None and "email_verified" in (st.session_state.get("_auth_db_detail") or ""):
+        row.pop("email_verified", None)
+        u = _insert_user(row)
+    return u
+
+
+def mark_email_verified(email: str) -> bool:
+    """Flip email_verified=true for an address (used when a confirmation link is clicked).
+
+    Returns True only if a row was actually updated (return=representation is set, so an
+    empty result means no matching/affected row, e.g. unknown email or missing column)."""
+    try:
+        res = _req("PATCH", "users", body={"email_verified": True},
+                   params={"email": f"eq.{email.lower()}"})
+        return bool(res)
+    except Exception:
+        return False
 
 
 def list_users():
@@ -229,6 +284,31 @@ def _verify_token(token: str) -> str | None:
         return None
 
 
+def _sign_verify_token(email: str) -> str:
+    """A short-lived, namespaced HMAC token for the email-confirmation link.
+
+    Signed over a 'verify|...' prefix so it can never be replayed as a login cookie
+    (and vice-versa), using the same secret as the cookie.
+    """
+    key = _cookie_secret()
+    exp = int(time.time()) + VERIFY_DAYS * 86400
+    sig = hmac.new(key.encode(), f"verify|{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{email}|{exp}|{sig}".encode()).decode()
+
+
+def _verify_verify_token(token: str) -> str | None:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        email, exp, sig = raw.split("|")
+        if int(exp) < time.time():
+            return None
+        key = _cookie_secret()
+        good = hmac.new(key.encode(), f"verify|{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+        return email if hmac.compare_digest(good, sig) else None
+    except Exception:
+        return None
+
+
 def _set_cookie(email: str) -> None:
     if not _CM:
         return
@@ -260,6 +340,97 @@ def _clear_cookie() -> None:
 
 
 # --------------------------------------------------------------------------
+# Email verification (Resend HTTP API — no extra dependency)
+# --------------------------------------------------------------------------
+def _verification_email_html(link: str, full_name: str) -> str:
+    name = full_name or "there"
+    return (
+        '<div style="font-family:Arial,Helvetica,sans-serif;background:#000;padding:32px;color:#f3f4f6;">'
+        '<div style="max-width:480px;margin:0 auto;background:#0c0c0c;border:1px solid #222;border-radius:6px;padding:32px;">'
+        '<h1 style="color:#ff6b35;margin:0 0 6px;font-size:24px;">CAPRA Finance</h1>'
+        '<p style="color:#9ca3af;margin:0 0 24px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;">Confirm your email</p>'
+        f'<p>Hi {name},</p>'
+        '<p>Thanks for signing up. Please confirm your email address to continue — '
+        'after that an administrator will approve your account.</p>'
+        f'<p style="text-align:center;margin:28px 0;"><a href="{link}" '
+        'style="background:#ff6b35;color:#000;text-decoration:none;font-weight:bold;'
+        'padding:12px 28px;border-radius:4px;display:inline-block;">Confirm my email</a></p>'
+        '<p style="color:#9ca3af;font-size:12px;">Or paste this link into your browser:</p>'
+        f'<p style="color:#9ca3af;font-size:12px;word-break:break-all;">{link}</p>'
+        '<p style="color:#6b7280;font-size:11px;margin-top:24px;">This link expires in 3 days. '
+        "If you didn't create this account, you can safely ignore this email.</p>"
+        '</div></div>'
+    )
+
+
+def send_verification_email(email: str, full_name: str = "") -> bool:
+    """Email a signed confirmation link via Resend. Returns True on success."""
+    if not email_configured():
+        return False
+    token = _sign_verify_token(email.lower())
+    link = f"{_app_url()}/?verify={urllib.parse.quote(token, safe='')}"
+    payload = {
+        "from": _mail_from(),
+        "to": [email],
+        "subject": "Confirm your email · CAPRA Finance",
+        "html": _verification_email_html(link, full_name),
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bearer {_secret('RESEND_API_KEY')}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=12) as r:
+            r.read()
+        st.session_state.pop("_mail_error", None)
+        return True
+    except Exception as exc:
+        st.session_state["_mail_error"] = _error_detail(exc)
+        return False
+
+
+def handle_verification_link() -> None:
+    """If the URL carries ?verify=<token>, confirm that email then strip the param."""
+    try:
+        token = st.query_params.get("verify")
+    except Exception:
+        token = None
+    if not token:
+        return
+    email = _verify_verify_token(token)
+    if email:
+        st.session_state["_verify_flash"] = ("ok" if mark_email_verified(email) else "dberr", email)
+    else:
+        st.session_state["_verify_flash"] = ("bad", None)
+    try:
+        del st.query_params["verify"]
+    except Exception:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+
+
+def _render_verify_flash() -> None:
+    """Show the result of clicking a confirmation link (once)."""
+    flash = st.session_state.pop("_verify_flash", None)
+    if not flash:
+        return
+    kind, em = flash
+    if kind == "ok":
+        st.success(f"✅ Email confirmed for **{em}**! You can log in once an administrator approves your account.")
+    elif kind == "dberr":
+        st.warning("We couldn't save your confirmation just now. Please click the link again, or contact the admin.")
+    else:
+        st.error("This confirmation link is invalid or has expired. Log in and request a fresh one.")
+
+
+# --------------------------------------------------------------------------
 # Session helpers
 # --------------------------------------------------------------------------
 def current_user() -> dict | None:
@@ -269,10 +440,36 @@ def current_user() -> dict | None:
 def logout() -> None:
     _clear_cookie()
     st.session_state.pop("_auth_user", None)
+    st.session_state.pop("_verify_flash", None)  # don't show a stale confirmation banner later
 
 
 def is_admin(user: dict | None) -> bool:
     return ROLE_RANK.get((user or {}).get("role", "user"), 0) >= 1
+
+
+def _is_super(user: dict | None) -> bool:
+    return (user or {}).get("role") == "superadmin"
+
+
+def _email_verified_ok(user: dict | None) -> bool:
+    """Email requirement satisfied?
+
+    True if verification is off, the user is the super-admin (always exempt), or the
+    user is verified. Also True when the row has NO email_verified key at all — that
+    only happens before the column migration has run, and we fail OPEN there so a
+    half-finished setup can never lock out existing approved users.
+    """
+    if (not email_configured()) or _is_super(user):
+        return True
+    u = user or {}
+    if "email_verified" not in u:   # column not added yet (pre-migration) → don't block
+        return True
+    return bool(u.get("email_verified"))
+
+
+def _fully_cleared(user: dict | None) -> bool:
+    """A user who may enter the app: approved AND past the email gate."""
+    return (user or {}).get("status") == "approved" and _email_verified_ok(user)
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +485,7 @@ def _auth_screen() -> None:
     )
     _, mid, _ = st.columns([1, 1.5, 1])
     with mid:
+        _render_verify_flash()
         tab_login, tab_signup = st.tabs(["🔐 Log in", "✍️ Sign up"])
 
         with tab_login:
@@ -300,7 +498,7 @@ def _auth_screen() -> None:
                         st.error("Wrong email or password.")
                     else:
                         st.session_state["_auth_user"] = u
-                        if u.get("status") == "approved":
+                        if _fully_cleared(u):
                             _set_cookie(u["email"])  # remember me
                         st.rerun()
 
@@ -347,6 +545,17 @@ def _auth_screen() -> None:
                             _set_cookie(u["email"])  # remember me (super-admin auto-approved)
                             st.success("Welcome — you're in!")
                             st.rerun()
+                        elif email_configured():
+                            sent = send_verification_email(u["email"], u.get("full_name", ""))
+                            if sent:
+                                st.success(f"✅ Account created! We've emailed a confirmation link to **{email2}**. "
+                                           "Click it to verify your address — then an administrator will approve you. "
+                                           "(Check your spam folder if it's not in your inbox.)")
+                            else:
+                                st.warning("✅ Account created, but we couldn't send the confirmation email right now. "
+                                           "Try logging in to resend it, or contact the administrator.")
+                                if st.session_state.get("_mail_error"):
+                                    st.caption(f"🔎 Mail detail (for setup): {st.session_state['_mail_error']}")
                         else:
                             st.success("✅ Account created! An administrator needs to approve you "
                                        "before you can log in. You'll get access once they do.")
@@ -358,11 +567,32 @@ def _pending_screen(u: dict) -> None:
     st.markdown("<h2 style='text-align:center;margin-top:12vh;'>⏳ Awaiting approval</h2>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
+        _render_verify_flash()
         st.info(f"Hi **{u.get('full_name') or u.get('email')}** — your account is **pending admin approval**. "
                 "You'll get full access the moment an administrator approves it.")
         if st.button("Log out", use_container_width=True):
             logout()
             st.rerun()
+    st.stop()
+
+
+def _unverified_screen(u: dict) -> None:
+    st.markdown("<h2 style='text-align:center;margin-top:12vh;'>✉️ Confirm your email</h2>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        _render_verify_flash()
+        st.info(f"We sent a confirmation link to **{u.get('email')}**. Open it to verify your address — "
+                "then an administrator will approve you. Check your spam folder if it hasn't arrived.")
+        c1, c2 = st.columns(2)
+        if c1.button("📧 Resend email", use_container_width=True):
+            if send_verification_email(u.get("email", ""), u.get("full_name", "")):
+                st.success("Sent! Check your inbox (and spam).")
+            else:
+                st.error("Couldn't send right now. " + (st.session_state.get("_mail_error") or "Try again shortly."))
+        if c2.button("Log out", use_container_width=True):
+            logout()
+            st.rerun()
+        st.caption("Already clicked the link? Just refresh this page.")
     st.stop()
 
 
@@ -376,7 +606,8 @@ def require_auth() -> dict:
         # still preview the (empty) admin panel and see setup instructions there.
         return {"role": "superadmin", "email": "local", "full_name": "Guest", "_auth_disabled": True}
 
-    _init_cookies()  # one CookieManager per run
+    _init_cookies()              # one CookieManager per run
+    handle_verification_link()   # process ?verify=<token> before anything else
 
     u = current_user()
     if not u:
@@ -384,13 +615,23 @@ def require_auth() -> dict:
         cookie_email = _read_cookie_email()
         if cookie_email:
             fresh = get_user(cookie_email)
-            if fresh and fresh.get("status") == "approved":
+            if fresh and _fully_cleared(fresh):
                 st.session_state["_auth_user"] = fresh
                 u = fresh
 
     if not u:
         _auth_screen()  # halts
 
+    # Email-confirmation gate (only when email sending is configured).
+    if not _email_verified_ok(u):
+        fresh = get_user(u.get("email", ""))          # maybe confirmed in another tab
+        if fresh and _email_verified_ok(fresh):
+            st.session_state["_auth_user"] = fresh
+            u = fresh
+        else:
+            _unverified_screen(u)  # halts
+
+    # Admin-approval gate.
     if u.get("status") != "approved":
         fresh = get_user(u.get("email", ""))          # maybe approved since they logged in
         if fresh and fresh.get("status") == "approved":
@@ -445,7 +686,11 @@ def render_admin_panel() -> None:
         st.markdown("##### ⏳ Pending approvals")
         for u in pending:
             c1, c2, c3 = st.columns([4, 1, 1])
-            c1.markdown(f"**{u.get('full_name') or '—'}** · `{u.get('email')}`")
+            if email_configured():
+                ver = "✅ email confirmed" if u.get("email_verified") else "✉️ not confirmed yet"
+                c1.markdown(f"**{u.get('full_name') or '—'}** · `{u.get('email')}` — {ver}")
+            else:
+                c1.markdown(f"**{u.get('full_name') or '—'}** · `{u.get('email')}`")
             if c2.button("✅ Approve", key=f"appr_{u['id']}", use_container_width=True):
                 update_user(u["id"], {"status": "approved"})
                 st.rerun()
@@ -456,9 +701,11 @@ def render_admin_panel() -> None:
 
     # ---- All users table ----
     st.markdown("##### All users")
+    _emailing = email_configured()
     df = pd.DataFrame([{
         "Email": u.get("email"), "Name": u.get("full_name"),
         "Role": u.get("role"), "Status": u.get("status"),
+        **({"Confirmed": "✅" if u.get("email_verified") else "—"} if _emailing else {}),
         "Joined": (u.get("created_at") or "")[:10],
     } for u in users])
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -496,6 +743,11 @@ def render_admin_panel() -> None:
     if is_super_admin and not is_self and target.get("role") != "superadmin":
         if cols[2].button("🗑 Delete", key="mng_delete", use_container_width=True):
             delete_user(target["id"]); st.rerun()
+
+    # Manually confirm email (any admin) — rescue path if mail delivery is broken.
+    if email_configured() and not target.get("email_verified"):
+        if cols[3].button("✉️ Mark confirmed", key="mng_verify", use_container_width=True):
+            update_user(target["id"], {"email_verified": True}); st.rerun()
 
     if not is_super_admin:
         st.caption("Role changes and deletion are restricted to the super-admin.")
