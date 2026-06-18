@@ -32,6 +32,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 from sklearn.linear_model import LinearRegression
 
+import auth
 from tickers import MARKET_PRESETS, NASDAQ_TRADER_SOURCES, WIKIPEDIA_INDEX_SOURCES
 
 STORAGE_PATH = Path(__file__).parent / "user_state.json"
@@ -3248,6 +3249,15 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
+# Authentication gate. Activates only when Supabase secrets are present; otherwise
+# the app runs open. Halts here (showing the login/sign-up screen) until the user
+# is logged in AND approved by an admin.
+# ---------------------------------------------------------------------------
+_auth_user = auth.require_auth()
+_is_admin = auth.is_admin(_auth_user) and not _auth_user.get("_auth_disabled")
+_auth_on = auth.is_configured()
+
+# ---------------------------------------------------------------------------
 # Cinematic intro — Nolan-style logo reveal, plays once per browser session.
 # NON-BLOCKING: the overlay is a fixed, top-z-index layer that the app renders
 # BEHIND in the same run, and a pure-CSS animation fades it out after ~3s. So the
@@ -3331,11 +3341,23 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Signed-in user bar (only when auth is active) — shows who's logged in + logout.
+if _auth_on:
+    _ub1, _ub2 = st.columns([6, 1])
+    _ub1.caption(f"👤 **{_auth_user.get('full_name') or _auth_user.get('email')}** "
+                 f"· {_auth_user.get('email')} · role: `{_auth_user.get('role','user')}`")
+    if _ub2.button("Log out", use_container_width=True, key="logout_btn"):
+        auth.logout()
+        st.rerun()
+
 # Page selector — tab-style. Markets page renders + st.stop()s so the existing
 # stock pipeline below only executes when on the Stocks view.
+_views = ["📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer"]
+if _is_admin:
+    _views.append("🛡️ Admin")
 _active_view = st.radio(
     "View",
-    ["📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer"],
+    _views,
     horizontal=True,
     label_visibility="collapsed",
     key="active_view",
@@ -3345,6 +3367,9 @@ if _active_view == "🚀 Top Movers":
     st.stop()
 if _active_view == "🔬 Stock Analyzer":
     render_stock_analyzer()
+    st.stop()
+if _active_view == "🛡️ Admin":
+    auth.render_admin_panel()
     st.stop()
 
 # ---- Sidebar -------------------------------------------------------------
