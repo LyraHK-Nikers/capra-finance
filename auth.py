@@ -54,6 +54,17 @@ def _superadmin_email() -> str:
     return _secret("SUPERADMIN_EMAIL").lower()
 
 
+def _cookie_secret() -> str:
+    """Secret used to sign the remember-me cookie.
+
+    Prefer a dedicated COOKIE_SECRET so cookie signing is decoupled from the
+    database key (rotating the DB key then won't silently invalidate sessions,
+    and a leak of one secret doesn't compromise the other). Falls back to
+    SUPABASE_KEY when COOKIE_SECRET isn't set, so existing setups keep working.
+    """
+    return _secret("COOKIE_SECRET") or _cfg()[1]
+
+
 # --------------------------------------------------------------------------
 # Password hashing (PBKDF2-SHA256, stdlib)
 # --------------------------------------------------------------------------
@@ -149,7 +160,7 @@ def _init_cookies() -> None:
 
 
 def _sign_token(email: str) -> str:
-    _url, key = _cfg()
+    key = _cookie_secret()
     exp = int(time.time()) + COOKIE_DAYS * 86400
     msg = f"{email}|{exp}"
     sig = hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
@@ -162,7 +173,7 @@ def _verify_token(token: str) -> str | None:
         email, exp, sig = raw.split("|")
         if int(exp) < time.time():
             return None
-        _url, key = _cfg()
+        key = _cookie_secret()
         good = hmac.new(key.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
         return email if hmac.compare_digest(good, sig) else None
     except Exception:
