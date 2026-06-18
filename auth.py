@@ -14,16 +14,21 @@ Design notes
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import secrets as _secrets
+import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 
 ROLE_RANK = {"user": 0, "admin": 1, "superadmin": 2}
+COOKIE_NAME = "capra_auth"
+COOKIE_DAYS = 30
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +131,75 @@ def delete_user(uid):
 
 
 # --------------------------------------------------------------------------
+# "Remember me" — signed token in a first-party cookie (survives refresh).
+# Fail-safe: if the cookie component isn't available, auth falls back to
+# session-only (you'd re-login on refresh) — it never breaks login.
+# --------------------------------------------------------------------------
+_CM = None  # CookieManager for the current run (re-created each run)
+
+
+def _init_cookies() -> None:
+    """Instantiate ONE CookieManager per script run (components must be fresh)."""
+    global _CM
+    try:
+        import extra_streamlit_components as stx
+        _CM = stx.CookieManager(key="capra_cookies")
+    except Exception:
+        _CM = None
+
+
+def _sign_token(email: str) -> str:
+    _url, key = _cfg()
+    exp = int(time.time()) + COOKIE_DAYS * 86400
+    msg = f"{email}|{exp}"
+    sig = hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+
+
+def _verify_token(token: str) -> str | None:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        email, exp, sig = raw.split("|")
+        if int(exp) < time.time():
+            return None
+        _url, key = _cfg()
+        good = hmac.new(key.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+        return email if hmac.compare_digest(good, sig) else None
+    except Exception:
+        return None
+
+
+def _set_cookie(email: str) -> None:
+    if not _CM:
+        return
+    try:
+        _CM.set(COOKIE_NAME, _sign_token(email),
+                expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_DAYS),
+                key="capra_set_cookie")
+    except Exception:
+        pass
+
+
+def _read_cookie_email() -> str | None:
+    if not _CM:
+        return None
+    try:
+        tok = _CM.get(COOKIE_NAME)
+        return _verify_token(tok) if tok else None
+    except Exception:
+        return None
+
+
+def _clear_cookie() -> None:
+    if not _CM:
+        return
+    try:
+        _CM.delete(COOKIE_NAME, key="capra_del_cookie")
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
 # Session helpers
 # --------------------------------------------------------------------------
 def current_user() -> dict | None:
@@ -133,6 +207,7 @@ def current_user() -> dict | None:
 
 
 def logout() -> None:
+    _clear_cookie()
     st.session_state.pop("_auth_user", None)
 
 
@@ -165,6 +240,8 @@ def _auth_screen() -> None:
                         st.error("Wrong email or password.")
                     else:
                         st.session_state["_auth_user"] = u
+                        if u.get("status") == "approved":
+                            _set_cookie(u["email"])  # remember me
                         st.rerun()
 
         with tab_signup:
@@ -188,6 +265,7 @@ def _auth_screen() -> None:
                             st.error("Couldn't create the account (database error). Try again shortly.")
                         elif u.get("status") == "approved":
                             st.session_state["_auth_user"] = u
+                            _set_cookie(u["email"])  # remember me (super-admin auto-approved)
                             st.success("Welcome — you're in!")
                             st.rerun()
                         else:
@@ -219,7 +297,18 @@ def require_auth() -> dict:
         # still preview the (empty) admin panel and see setup instructions there.
         return {"role": "superadmin", "email": "local", "full_name": "Guest", "_auth_disabled": True}
 
+    _init_cookies()  # one CookieManager per run
+
     u = current_user()
+    if not u:
+        # "Remember me": restore the session from a valid signed cookie.
+        cookie_email = _read_cookie_email()
+        if cookie_email:
+            fresh = get_user(cookie_email)
+            if fresh and fresh.get("status") == "approved":
+                st.session_state["_auth_user"] = fresh
+                u = fresh
+
     if not u:
         _auth_screen()  # halts
 
