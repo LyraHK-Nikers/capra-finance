@@ -16,6 +16,11 @@ Design notes
   AND be approved before they can log in. The super-admin is always exempt. With those
   secrets absent, the email step is skipped entirely and nothing changes.
   Requires a `email_verified boolean not null default false` column on `users`.
+- Forgot password: when email is configured, the login screen offers a reset flow that
+  emails a single-use signed link (?reset=...) to set a new password. The link is bound
+  to the current password hash, so it stops working once used or once the password
+  changes. Admins can also issue a temporary password from the admin panel (works even
+  without email configured), so account recovery is always possible.
 """
 from __future__ import annotations
 
@@ -24,6 +29,7 @@ import hashlib
 import hmac
 import json
 import secrets as _secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -35,7 +41,8 @@ import streamlit as st
 ROLE_RANK = {"user": 0, "admin": 1, "superadmin": 2}
 COOKIE_NAME = "capra_auth"
 COOKIE_DAYS = 30
-VERIFY_DAYS = 3  # how long an email-confirmation link stays valid
+VERIFY_DAYS = 3      # how long an email-confirmation link stays valid
+RESET_MINUTES = 60  # how long a password-reset link stays valid
 
 
 # --------------------------------------------------------------------------
@@ -224,6 +231,16 @@ def mark_email_verified(email: str) -> bool:
         return False
 
 
+def reset_password(email: str, new_pw: str) -> bool:
+    """Set a new password hash for an address. Returns True if a row was updated."""
+    try:
+        res = _req("PATCH", "users", body={"password_hash": hash_password(new_pw)},
+                   params={"email": f"eq.{email.lower()}"})
+        return bool(res)
+    except Exception:
+        return False
+
+
 def list_users():
     try:
         return _req("GET", "users", params={"select": "*", "order": "created_at.desc"})
@@ -264,22 +281,30 @@ def _init_cookies() -> None:
 
 
 def _sign_token(email: str) -> str:
+    # Bind the cookie to a fingerprint of the current password hash so that a
+    # password reset (self-service OR admin) transitively revokes every remember-me
+    # session on all devices — a stolen cookie stops working the moment the password changes.
     key = _cookie_secret()
     exp = int(time.time()) + COOKIE_DAYS * 86400
-    msg = f"{email}|{exp}"
-    sig = hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+    fp = _reset_fingerprint(email) or ""
+    sig = hmac.new(key.encode(), f"{email}|{exp}|{fp}".encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{email}|{exp}|{fp}|{sig}".encode()).decode()
 
 
 def _verify_token(token: str) -> str | None:
     try:
         raw = base64.urlsafe_b64decode(token.encode()).decode()
-        email, exp, sig = raw.split("|")
+        email, exp, fp, sig = raw.split("|")
         if int(exp) < time.time():
             return None
         key = _cookie_secret()
-        good = hmac.new(key.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
-        return email if hmac.compare_digest(good, sig) else None
+        good = hmac.new(key.encode(), f"{email}|{exp}|{fp}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good, sig):
+            return None
+        cur = _reset_fingerprint(email)   # revoke if the password changed since issue
+        if cur is None or fp != cur:
+            return None
+        return email
     except Exception:
         return None
 
@@ -304,6 +329,45 @@ def _verify_verify_token(token: str) -> str | None:
             return None
         key = _cookie_secret()
         good = hmac.new(key.encode(), f"verify|{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+        return email if hmac.compare_digest(good, sig) else None
+    except Exception:
+        return None
+
+
+def _reset_fingerprint(email: str) -> str | None:
+    """Short hash of the user's CURRENT password hash.
+
+    Baked into reset tokens so a link becomes single-use: once the password changes
+    (or was changed by any other means), the fingerprint no longer matches and old
+    reset links stop working. Returns None if the account doesn't exist.
+    """
+    u = get_user(email)
+    if not u:
+        return None
+    return hashlib.sha256((u.get("password_hash") or "").encode()).hexdigest()[:16]
+
+
+def _sign_reset_token(email: str) -> str | None:
+    fp = _reset_fingerprint(email)
+    if fp is None:
+        return None
+    key = _cookie_secret()
+    exp = int(time.time()) + RESET_MINUTES * 60
+    sig = hmac.new(key.encode(), f"reset|{email}|{exp}|{fp}".encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{email}|{exp}|{sig}".encode()).decode()
+
+
+def _verify_reset_token(token: str) -> str | None:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        email, exp, sig = raw.split("|")
+        if int(exp) < time.time():
+            return None
+        fp = _reset_fingerprint(email)        # current state → single-use enforcement
+        if fp is None:
+            return None
+        key = _cookie_secret()
+        good = hmac.new(key.encode(), f"reset|{email}|{exp}|{fp}".encode(), hashlib.sha256).hexdigest()
         return email if hmac.compare_digest(good, sig) else None
     except Exception:
         return None
@@ -417,17 +481,100 @@ def handle_verification_link() -> None:
 
 
 def _render_verify_flash() -> None:
-    """Show the result of clicking a confirmation link (once)."""
+    """Show the result of clicking a confirmation/reset link (once)."""
     flash = st.session_state.pop("_verify_flash", None)
     if not flash:
         return
     kind, em = flash
     if kind == "ok":
         st.success(f"✅ Email confirmed for **{em}**! You can log in once an administrator approves your account.")
+    elif kind == "pwreset":
+        st.success(f"✅ Password updated for **{em}**. Log in with your new password.")
     elif kind == "dberr":
         st.warning("We couldn't save your confirmation just now. Please click the link again, or contact the admin.")
     else:
         st.error("This confirmation link is invalid or has expired. Log in and request a fresh one.")
+
+
+# --------------------------------------------------------------------------
+# Password reset (signed, single-use link via Resend)
+# --------------------------------------------------------------------------
+def _reset_email_html(link: str) -> str:
+    return (
+        '<div style="font-family:Arial,Helvetica,sans-serif;background:#000;padding:32px;color:#f3f4f6;">'
+        '<div style="max-width:480px;margin:0 auto;background:#0c0c0c;border:1px solid #222;border-radius:6px;padding:32px;">'
+        '<h1 style="color:#ff6b35;margin:0 0 6px;font-size:24px;">CAPRA Finance</h1>'
+        '<p style="color:#9ca3af;margin:0 0 24px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;">Reset your password</p>'
+        '<p>We received a request to reset your password. Click below to choose a new one:</p>'
+        f'<p style="text-align:center;margin:28px 0;"><a href="{link}" '
+        'style="background:#ff6b35;color:#000;text-decoration:none;font-weight:bold;'
+        'padding:12px 28px;border-radius:4px;display:inline-block;">Reset my password</a></p>'
+        '<p style="color:#9ca3af;font-size:12px;">Or paste this link into your browser:</p>'
+        f'<p style="color:#9ca3af;font-size:12px;word-break:break-all;">{link}</p>'
+        '<p style="color:#6b7280;font-size:11px;margin-top:24px;">This link expires in 1 hour and can be used once. '
+        "If you didn't request this, you can safely ignore this email — your password won't change.</p>"
+        '</div></div>'
+    )
+
+
+def _post_email_async(payload: dict) -> None:
+    """Fire a Resend send on a daemon thread so the request latency doesn't depend
+    on whether an account exists (defeats timing-based email enumeration)."""
+    key = _secret("RESEND_API_KEY")
+
+    def _send():
+        try:
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=json.dumps(payload).encode(),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12) as r:
+                r.read()
+        except Exception:
+            pass  # nothing to surface — the UI shows the same generic message regardless
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def send_password_reset(email: str) -> bool:
+    """Email a single-use reset link IF the account exists. Stays silent about whether
+    an account exists — same message and (roughly) same latency either way, since the
+    actual send happens off the request path."""
+    email = (email or "").lower()
+    if not email_configured():
+        return False
+    token = _sign_reset_token(email)   # None when the account doesn't exist
+    if not token:
+        return False
+    link = f"{_app_url()}/?reset={urllib.parse.quote(token, safe='')}"
+    _post_email_async({
+        "from": _mail_from(),
+        "to": [email],
+        "subject": "Reset your password · CAPRA Finance",
+        "html": _reset_email_html(link),
+    })
+    return True
+
+
+def handle_reset_link() -> None:
+    """If the URL carries ?reset=<token>, stash the verified email so the
+    set-new-password screen can render, then strip the param."""
+    try:
+        token = st.query_params.get("reset")
+    except Exception:
+        token = None
+    if not token:
+        return
+    st.session_state["_reset_email"] = _verify_reset_token(token)  # email, or None if invalid
+    try:
+        del st.query_params["reset"]
+    except Exception:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -501,6 +648,18 @@ def _auth_screen() -> None:
                         if _fully_cleared(u):
                             _set_cookie(u["email"])  # remember me
                         st.rerun()
+
+            # Forgot password (outside the login form so it submits independently)
+            if email_configured():
+                with st.expander("Forgot your password?"):
+                    with st.form("forgot_form", clear_on_submit=True):
+                        fp_email = st.text_input("Your account email", key="fp_email").strip().lower()
+                        if st.form_submit_button("Send reset link", use_container_width=True):
+                            send_password_reset(fp_email)
+                            st.success("If an account exists for that email, we've sent a reset link. "
+                                       "Check your inbox (and spam).")
+            else:
+                st.caption("Forgot your password? Ask an administrator to reset it for you.")
 
         with tab_signup:
             with st.form("signup_form", clear_on_submit=False):
@@ -596,6 +755,42 @@ def _unverified_screen(u: dict) -> None:
     st.stop()
 
 
+def _reset_password_screen() -> None:
+    """Shown when the URL carried a ?reset token. Lets the user set a new password."""
+    email = st.session_state.get("_reset_email")
+    st.markdown("<h2 style='text-align:center;margin-top:12vh;'>🔑 Set a new password</h2>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        if not email:
+            st.error("This reset link is invalid or has expired (reset links work once and last 1 hour). "
+                     "Request a fresh one from the login screen.")
+            if st.button("← Back to login", use_container_width=True):
+                st.session_state.pop("_reset_email", None)
+                st.rerun()
+            st.stop()
+
+        st.info(f"Choose a new password for **{email}**.")
+        with st.form("reset_form", clear_on_submit=False):
+            p1 = st.text_input("New password (min 8 chars)", type="password", key="rs_pw1")
+            p2 = st.text_input("Confirm new password", type="password", key="rs_pw2")
+            if st.form_submit_button("Update password", use_container_width=True):
+                if len(p1) < 8:
+                    st.error("Password must be at least 8 characters.")
+                elif p1 != p2:
+                    st.error("Passwords don't match.")
+                elif reset_password(email, p1):
+                    st.session_state.pop("_reset_email", None)
+                    logout()  # force a fresh login with the new password (also kills old sessions)
+                    st.session_state["_verify_flash"] = ("pwreset", email)
+                    st.rerun()
+                else:
+                    st.error("Couldn't update the password just now. Please request a new link and try again.")
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.pop("_reset_email", None)
+            st.rerun()
+    st.stop()
+
+
 def require_auth() -> dict:
     """Gate the app. Returns the user dict (or a guest superadmin if auth is OFF).
 
@@ -607,7 +802,12 @@ def require_auth() -> dict:
         return {"role": "superadmin", "email": "local", "full_name": "Guest", "_auth_disabled": True}
 
     _init_cookies()              # one CookieManager per run
-    handle_verification_link()   # process ?verify=<token> before anything else
+    handle_verification_link()   # process ?verify=<token>
+    handle_reset_link()          # process ?reset=<token>
+
+    # A valid (or invalid) reset link takes priority — show the set-password screen.
+    if "_reset_email" in st.session_state:
+        _reset_password_screen()  # halts
 
     u = current_user()
     if not u:
@@ -748,6 +948,23 @@ def render_admin_panel() -> None:
     if email_configured() and not target.get("email_verified"):
         if cols[3].button("✉️ Mark confirmed", key="mng_verify", use_container_width=True):
             update_user(target["id"], {"email_verified": True}); st.rerun()
+
+    # Reset password (any admin) — issues a temporary password to hand over.
+    # Works even when email isn't configured, so password recovery is always possible.
+    if st.button("🔑 Reset password (issue a temporary one)", key="mng_pwreset", use_container_width=True):
+        temp = _secrets.token_urlsafe(9)
+        if reset_password(target["email"], temp):
+            st.session_state["_temp_pw_for"] = (target["email"], temp)
+        else:
+            st.session_state.pop("_temp_pw_for", None)
+            st.error("Couldn't reset that password just now. Try again shortly.")
+        st.rerun()
+    tp = st.session_state.get("_temp_pw_for")
+    if tp and tp[0] == target.get("email"):
+        st.warning(f"Temporary password for **{tp[0]}**: `{tp[1]}`\n\n"
+                   "Share it securely. They can log in with it, then use **Forgot your password?** "
+                   "to set their own (once email is enabled). This is shown once.")
+        st.session_state.pop("_temp_pw_for", None)
 
     if not is_super_admin:
         st.caption("Role changes and deletion are restricted to the super-admin.")
