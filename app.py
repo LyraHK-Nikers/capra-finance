@@ -3341,11 +3341,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Signed-in user bar (only when auth is active) — shows who's logged in + logout.
+# Access bar (only when a password is set) — signed-in indicator + logout.
 if _auth_on:
     _ub1, _ub2 = st.columns([6, 1])
-    _ub1.caption(f"👤 **{_auth_user.get('full_name') or _auth_user.get('email')}** "
-                 f"· {_auth_user.get('email')} · role: `{_auth_user.get('role','user')}`")
+    _ub1.caption("🔓 Signed in with the shared access password.")
     if _ub2.button("Log out", use_container_width=True, key="logout_btn"):
         auth.logout()
         st.rerun()
