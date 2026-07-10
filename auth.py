@@ -649,17 +649,20 @@ def _auth_screen() -> None:
                             _set_cookie(u["email"])  # remember me
                         st.rerun()
 
-            # Forgot password (outside the login form so it submits independently)
-            if email_configured():
-                with st.expander("Forgot your password?"):
+            # Forgot password — always visible; self-service when email is configured,
+            # otherwise it points the user to the administrator.
+            with st.expander("🔑 Forgot your password?"):
+                if email_configured():
                     with st.form("forgot_form", clear_on_submit=True):
                         fp_email = st.text_input("Your account email", key="fp_email").strip().lower()
                         if st.form_submit_button("Send reset link", use_container_width=True):
                             send_password_reset(fp_email)
                             st.success("If an account exists for that email, we've sent a reset link. "
                                        "Check your inbox (and spam).")
-            else:
-                st.caption("Forgot your password? Ask an administrator to reset it for you.")
+                else:
+                    st.info("Password reset by email isn't switched on yet. Please contact the "
+                            "administrator at **contact@caprahk.com** — they can reset it for you "
+                            "from the admin panel in seconds.")
 
         with tab_signup:
             with st.form("signup_form", clear_on_submit=False):
