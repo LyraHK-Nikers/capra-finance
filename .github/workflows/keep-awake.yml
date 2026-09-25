@@ -1,0 +1,28 @@
+name: Keep app awake
+
+# Streamlit Community Cloud puts apps to sleep after ~12 hours with no visitors.
+# This opens the app in a headless browser every 4 hours so it never sits idle long
+# enough to fall asleep. You can also run it by hand from the Actions tab.
+on:
+  schedule:
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install headless browser
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Visit the app
+        run: python .github/scripts/wake_app.py
