@@ -1996,9 +1996,12 @@ def render_analyzer_body(chosen: str) -> None:
     for cat in ["Profitability", "Balance Sheet", "Cash Flow", "Valuation", "Quality"]:
         with st.expander(f"{_AN_DOT[cat_rating[cat]]}  {cat}", expanded=(cat == "Profitability")):
             for r in sections[cat]:
+                # Dollar amounts in prose must not be parsed as LaTeX delimiters.
+                meaning = r['meaning'].replace(chr(36), chr(92) + chr(36))
+                display = r['value'].replace(chr(36), chr(92) + chr(36))
                 st.markdown(
-                    f"{_AN_DOT[r['rating']]} **{r['label']} — {r['value']}**  \n"
-                    f"{r['meaning']}  \n"
+                    f"{_AN_DOT[r['rating']]} **{r['label']} — {display}**  \n"
+                    f"{meaning}  \n"
                     f"<span style='color:#94a3b8;font-size:0.82rem;'>Why it matters: {r['why']}</span>",
                     unsafe_allow_html=True,
                 )
