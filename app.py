@@ -33,11 +33,12 @@ from plotly.subplots import make_subplots
 from sklearn.linear_model import LinearRegression
 
 import auth
+from portfolio import render_portfolio
 from fundamentals import enrich_info, annual_rows, series as statement_series
 from comparison import render_comparison
 from valuation import (DCF_DEFAULTS, _finite, _first_finite, _annual_calibration,
                        _dcf_missing_inputs, _dcf_project, _dcf, _dcf_price_gm,
-                       _dcf_price_w, _capm_wacc, _implied_growth, _health_verdict)
+                       _dcf_price_w, _capm_wacc, _implied_growth, _health_verdict, _quote_unit)
 from tickers import MARKET_PRESETS, NASDAQ_TRADER_SOURCES, WIKIPEDIA_INDEX_SOURCES
 
 def load_storage() -> dict:
@@ -191,7 +192,7 @@ def _fetch_info_cached(ticker: str) -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_info(ticker: str) -> dict:
+def _fetch_enriched_cached(ticker: str) -> dict:
     """Enrich a partial/failed summary feed from independent reported statements."""
     try:
         info = _fetch_info_cached(ticker)
@@ -212,7 +213,26 @@ def fetch_info(ticker: str) -> dict:
         fin = fetch_financial_statements(ticker)
     except Exception:
         fin = {}
-    return enrich_info(info, fin, fast)
+    result = enrich_info(info, fin, fast)
+    if not info and not fast and not fin:
+        raise RuntimeError("Financial provider temporarily unavailable")
+    return result
+
+
+def fetch_info(ticker: str) -> dict:
+    try:
+        return _fetch_enriched_cached(ticker)
+    except Exception:
+        return {}
+
+
+def _clear_financial_info():
+    _fetch_enriched_cached.clear()
+    _fetch_info_cached.clear()
+    _fetch_statements_cached.clear()
+
+
+fetch_info.clear = _clear_financial_info
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -567,7 +587,7 @@ def _cagr(series: pd.Series, years: float) -> float:
         return float("nan")
     total_return = window.iloc[-1] / window.iloc[0]
     actual_years = (window.index[-1] - window.index[0]).days / 365.25
-    if actual_years <= 0:
+    if actual_years < years * .9:
         return float("nan")
     return total_return ** (1 / actual_years) - 1
 
@@ -753,8 +773,8 @@ def compute_metrics(
     pct_3m = _pct(90)
     # YTD — match year on the index without constructing a tz-aware Timestamp
     last_year = prices.index[-1].year
-    ytd_window = prices[prices.index.year == last_year]
-    pct_ytd = float(price / ytd_window.iloc[0] - 1) if not ytd_window.empty else float("nan")
+    prior_year = prices[prices.index.year < last_year]
+    pct_ytd = float(price / prior_year.iloc[-1] - 1) if not prior_year.empty else float("nan")
 
     # Cumulative price-change % over standard look-back windows (for the card toggle).
     # Measures from the FIRST price inside the window (robust when the fetched
@@ -769,7 +789,7 @@ def compute_metrics(
         # Require the window to actually span most of the requested period;
         # otherwise (e.g. a 1Y data fetch asked for a 5Y return) report "—".
         span_days = (prices.index[-1] - window.index[0]).days
-        if span_days < days * 0.6:
+        if span_days < days * 0.9:
             return float("nan")
         return float(price / window.iloc[0] - 1)
 
@@ -903,24 +923,24 @@ fetch_financial_statements.clear = _fetch_statements_cached.clear
 
 
 def _money(value) -> str:
-    """Compact monetary formatter: $1.23B, $456.7M, etc."""
+    """Compact amount; the surrounding table/header supplies its currency."""
     try:
         v = float(value)
     except (TypeError, ValueError):
         return "—"
-    if math.isnan(v):
+    if not math.isfinite(v):
         return "—"
     sign = "-" if v < 0 else ""
     v = abs(v)
     if v >= 1e12:
-        return f"{sign}${v/1e12:.2f}T"
+        return f"{sign}{v/1e12:.2f}T"
     if v >= 1e9:
-        return f"{sign}${v/1e9:.2f}B"
+        return f"{sign}{v/1e9:.2f}B"
     if v >= 1e6:
-        return f"{sign}${v/1e6:.2f}M"
+        return f"{sign}{v/1e6:.2f}M"
     if v >= 1e3:
-        return f"{sign}${v/1e3:.1f}K"
-    return f"{sign}${v:.0f}"
+        return f"{sign}{v/1e3:.1f}K"
+    return f"{sign}{v:.0f}"
 
 
 # ---------------------------------------------------------------------------
@@ -1506,9 +1526,12 @@ def fetch_valuation_base(ticker: str) -> dict | None:
     """
     tk = yf.Ticker(ticker)
     try:
-        info = tk.info or {}
+        info = fetch_info(ticker)
     except Exception:
-        info = {}
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
     try:
         fi = tk.fast_info
         def fast(key):
@@ -1531,13 +1554,17 @@ def fetch_valuation_base(ticker: str) -> dict | None:
         except Exception:
             pass
     try:
-        inc = tk.income_stmt
+        fin = fetch_financial_statements(ticker)
+        inc, cfs = fin.get('income'), fin.get('cashflow')
     except Exception:
-        inc = None
-    try:
-        cfs = tk.cashflow
-    except Exception:
-        cfs = None
+        try:
+            inc = tk.income_stmt
+        except Exception:
+            inc = None
+        try:
+            cfs = tk.cashflow
+        except Exception:
+            cfs = None
     calibration = _annual_calibration(inc, cfs)
     debt, cash = _first_finite(info.get("totalDebt")), _first_finite(info.get("totalCash"))
     if debt is None or cash is None:
@@ -1559,11 +1586,8 @@ def fetch_valuation_base(ticker: str) -> dict | None:
                     break
             except Exception:
                 pass
-    try:
-        info = dict(fetch_info(ticker), **{k: v for k, v in info.items() if v is not None})
-    except Exception:
-        pass
     ni = _first_finite(info.get("netIncomeToCommon"), info.get("netIncome"))
+    price = _first_finite(price, info.get("currentPrice"), info.get("regularMarketPrice"))
     shares = _first_finite(shares, info.get("sharesOutstanding"))
     currency = currency or info.get("currency")
     return {
@@ -2141,9 +2165,9 @@ A narrow range = robust thesis; a wild range = fragile.
 
     if base and not base.get("financial_currency"):
         st.warning("The financial-statement currency was not reported. Confirm it before comparing financial amounts with the quote.")
-        if not st.checkbox(f"I verified the statements are in {base.get('currency') or 'the quote currency'}", key=f"val_currency_{chosen}"):
+        if not st.checkbox(f"I verified the statements are in {_quote_unit(base.get('currency'))[0] or 'the quote currency'}", key=f"val_currency_{chosen}"):
             return
-        base = dict(base, financial_currency=base.get("currency"))
+        base = dict(base, financial_currency=_quote_unit(base.get("currency"))[0])
     missing = _dcf_missing_inputs(base)
     if missing:
         st.warning("DCF unavailable. Missing or incompatible inputs: " + ", ".join(missing) + ". No valuation or buy signal is generated.")
@@ -2225,6 +2249,10 @@ A narrow range = robust thesis; a wild range = fragile.
         return
     if D["tvShare"] > 0.75:
         st.caption(f"{D['tvShare']:.0%} of enterprise value comes from cash flows after year five. Review the sensitivity range.")
+    if a['capex'] < a['da'] and a['termg'] > 0:
+        st.caption("The terminal scenario assumes capital spending stays below D&A while sales grow. Check whether that spending can sustain the business; this can overstate long-run cash flow.")
+
+    st.caption(f"Prices and per-share targets use {cur}; enterprise and equity amounts use {_quote_unit(cur)[0]}.")
 
     # --- Verdict cards ---------------------------------------------------
     upside = D["upside"]
@@ -2392,7 +2420,7 @@ A narrow range = robust thesis; a wild range = fragile.
             _money(r["fcf"] * df_),
         ]
     st.dataframe(cf, use_container_width=True, hide_index=True)
-    tv_note = (f"**Terminal value** (year-5 FCF growing at {a['termg']*100:.1f}% forever, discounted): "
+    tv_note = (f"**Terminal value** (year-six cash flow rebuilt at {a['termg']*100:.1f}% stable growth, discounted): "
                f"{_money(D['pvtv'])} present value — that's {_fmt_pct(D['tvShare'])} of enterprise value."
                ) if D["pvtv"] == D["pvtv"] else ""
     if tv_note:
@@ -2447,20 +2475,22 @@ A narrow range = robust thesis; a wild range = fragile.
         "Peer tickers (comma-separated) — implied price from median P/E & EV/EBITDA",
         key="val_peers", placeholder="e.g. MSFT, GOOGL, META",
     )
-    peer_syms = [p.strip().upper() for p in peers_raw.split(",") if p.strip()]
+    peer_syms = list(dict.fromkeys(p.strip().upper() for p in peers_raw.split(",") if p.strip()))[:12]
     if peer_syms:
         all_syms = [chosen] + [p for p in peer_syms if p != chosen]
         rows, pes, evs = [], [], []
         for sym in all_syms:
             b = fetch_valuation_base(sym)
-            if not b or _dcf_missing_inputs(b):
+            if not b or _dcf_missing_inputs(b) or not b.get("financial_currency"):
+                continue
+            if _quote_unit(b["currency"])[0] != b["financial_currency"]:
                 continue
             eps = b["ni"] / b["shares"] if b["shares"] else float("nan")
             ebitda = b["rev"] * (b["margin"] + b["da"])
-            mc = b["price"] * b["shares"]
+            mc = b["price"] * _quote_unit(b["currency"])[1] * b["shares"]
             ev = mc + b["debt"] - b["cash"]
-            pe = (mc / b["ni"]) if b["ni"] else float("nan")
-            evb = (ev / ebitda) if ebitda else float("nan")
+            pe = (mc / b["ni"]) if _finite(b["ni"]) and b["ni"] > 0 else float("nan")
+            evb = (ev / ebitda) if ebitda > 0 else float("nan")
             rows.append({"Ticker": sym, "Name": b["name"], "Price": b["price"],
                          "P/E": pe, "EV/EBITDA": evb, "Yr-1 growth": b["g1"] * 100})
             if sym != chosen and pe == pe and pe > 0:
@@ -2473,9 +2503,12 @@ A narrow range = robust thesis; a wild range = fragile.
             med_ev = statistics.median(evs) if evs else float("nan")
             eps0 = base["ni"] / base["shares"] if base["shares"] else float("nan")
             ebitda0 = base["rev"] * (base["margin"] + base["da"])
-            pe_price = med_pe * eps0 if (med_pe == med_pe and eps0 == eps0) else float("nan")
+            pe_price = med_pe * eps0 if (med_pe == med_pe and _finite(eps0) and eps0 > 0) else float("nan")
             ev_price = ((med_ev * ebitda0) - (base["debt"] - base["cash"])) / base["shares"] \
-                if (med_ev == med_ev and base["shares"]) else float("nan")
+                if (med_ev == med_ev and base["shares"] and ebitda0 > 0) else float("nan")
+            factor = _quote_unit(base["currency"])[1]
+            pe_price, ev_price = pe_price / factor, ev_price / factor
+            st.caption("Peer targets exclude duplicate tickers, losses and unverified currency data. Different industries may not be comparable.")
             cc = st.columns(2)
             cc[0].metric("Implied price · median P/E", f"{pe_price:,.2f}" if pe_price == pe_price else "—",
                          _fmt_pct(pe_price / base["price"] - 1) if pe_price == pe_price else None)
@@ -3509,7 +3542,7 @@ the cleanest way to compare long-run performance across very different stocks.
 - **Comparison chart** — every stock rebased to 100 so you can see relative performance regardless of price.
 - **Sector heatmap** — today's moves grouped by sector (red→green), sized by trading value.
 - **Speculative Watch** — penny/micro caps and high-volatility mid caps (high risk, high reward).
-- **Forecast** — a *statistical* 30-day projection of the trend, **not** a guarantee.
+- **Forecast** — a *statistical* 30-session projection of the trend, **not** a guarantee.
 
 > Tip: high momentum + high score is exciting, but always sanity-check value on the **💰 Stock Valuation** page.
 > Educational tool, not investment advice.
@@ -3717,90 +3750,13 @@ if alert_defs:
 # ---- Portfolio P&L -------------------------------------------------------
 holdings = st.session_state.user_state.get("portfolio", [])
 if holdings:
-    st.subheader("💼 My Portfolio")
-    pf_tickers = tuple({h["ticker"] for h in holdings})
-    pf_prices_df = fetch_history(pf_tickers, period="5d")
-
-    rows = []
-    total_value = total_cost = total_day_change = 0.0
-    for h in holdings:
-        tk = h["ticker"]
-        if tk in pf_prices_df.columns:
-            series = pf_prices_df[tk].dropna()
-            cur = float(series.iloc[-1]) if not series.empty else float("nan")
-            prev = float(series.iloc[-2]) if len(series) >= 2 else cur
-        else:
-            cur = float("nan")
-            prev = float("nan")
-        qty = h["qty"]
-        cost_basis = h["cost"] * qty
-        market_value = cur * qty if not math.isnan(cur) else float("nan")
-        unrealized = market_value - cost_basis if not math.isnan(market_value) else float("nan")
-        ret_pct = (cur / h["cost"] - 1) * 100 if h["cost"] > 0 and not math.isnan(cur) else float("nan")
-        day_change_dollar = (cur - prev) * qty if not math.isnan(cur) and not math.isnan(prev) else 0.0
-
-        if not math.isnan(market_value):
-            total_value += market_value
-            total_cost += cost_basis
-            total_day_change += day_change_dollar
-
-        rows.append({
-            "Ticker": tk,
-            "Qty": qty,
-            "Avg Cost": h["cost"],
-            "Current Price": cur,
-            "Market Value": market_value,
-            "Cost Basis": cost_basis,
-            "Unrealized P&L": unrealized,
-            "Return %": ret_pct,
-            "Day Change $": day_change_dollar,
-        })
-
-    total_pnl = total_value - total_cost
-    total_pnl_pct = (total_value / total_cost - 1) * 100 if total_cost > 0 else float("nan")
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Value", f"{total_value:,.2f}")
-    k2.metric("Total Cost", f"{total_cost:,.2f}")
-    k3.metric(
-        "Unrealized P&L",
-        f"{total_pnl:,.2f}",
-        delta=f"{total_pnl_pct:+.2f}%" if not math.isnan(total_pnl_pct) else None,
-    )
-    k4.metric("Today's Change", f"{total_day_change:+,.2f}")
-
-    pf_df = pd.DataFrame(rows)
-    st.dataframe(
-        pf_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Avg Cost": st.column_config.NumberColumn(format="%.2f"),
-            "Current Price": st.column_config.NumberColumn(format="%.2f"),
-            "Market Value": st.column_config.NumberColumn(format="%.2f"),
-            "Cost Basis": st.column_config.NumberColumn(format="%.2f"),
-            "Unrealized P&L": st.column_config.NumberColumn(format="%+.2f"),
-            "Return %": st.column_config.NumberColumn(format="%+.2f"),
-            "Day Change $": st.column_config.NumberColumn(format="%+.2f"),
-        },
-    )
-
-    alloc_df = pf_df.dropna(subset=["Market Value"])
-    if not alloc_df.empty and alloc_df["Market Value"].sum() > 0:
-        alloc_fig = px.pie(
-            alloc_df, values="Market Value", names="Ticker",
-            title="Allocation by current market value", hole=0.4,
-        )
-        alloc_fig.update_layout(height=350, template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(alloc_fig, use_container_width=True)
-
-    st.divider()
+    render_portfolio(holdings, fetch_history, fetch_info)
 
 
 # ---- Market Signal Leaderboard -----------------------------------------------
 st.subheader("🏆 Market Signal Leaderboard")
 st.caption(
-    "Composite score (0–100) blending 3M momentum, 30-day forecast upside, analyst upside, "
+    "Composite score (0–100) blending 3M momentum, 30-session forecast upside, analyst upside, "
     "Sharpe ratio, P/E, and RSI. This is not a business valuation. "
     "Signals describe price behaviour, not a recommendation to trade. Missing financial data is flagged."
 )
@@ -4179,7 +4135,7 @@ st.dataframe(
 
 
 # ---- Forecast section ---------------------------------------------------
-st.subheader("🔮 30-Day Price Forecast")
+st.subheader("🔮 30-Session Price Forecast")
 st.caption(
     "Holt-Winters exponential smoothing where available, with a log-linear fallback. "
     "This is a *statistical projection of historical trend*, not a guarantee. "
@@ -4230,7 +4186,7 @@ if forecast_picks:
 
 # ---- Forecasted Profit / Analyst Targets --------------------------------
 st.subheader("💰 Forecasted Profits & Analyst Targets")
-st.caption("Per-share gain implied by both our 30-day statistical forecast and the consensus analyst price target.")
+st.caption("Per-share gain implied by both our 30-session statistical forecast and the consensus analyst price target.")
 
 profit_df = pd.DataFrame(
     [
@@ -4238,15 +4194,15 @@ profit_df = pd.DataFrame(
             "Ticker": m.ticker,
             "Name": m.name,
             "Current Price": m.price,
-            "30D Forecast": m.forecast_30d,
-            "30D Profit/Share": (m.forecast_30d - m.price) if not math.isnan(m.forecast_30d) else float("nan"),
+            "30-session forecast": m.forecast_30d,
+            "30-session change/share": (m.forecast_30d - m.price) if not math.isnan(m.forecast_30d) else float("nan"),
             "Analyst Target": m.analyst_target if m.analyst_target else float("nan"),
             "Analyst Profit/Share": ((m.analyst_target - m.price) if m.analyst_target else float("nan")),
             "P/E": m.pe_ratio if m.pe_ratio else float("nan"),
         }
         for m in all_metrics
     ]
-).sort_values("30D Profit/Share", ascending=False)
+).sort_values("30-session change/share", ascending=False)
 
 st.dataframe(
     profit_df,
@@ -4254,8 +4210,8 @@ st.dataframe(
     hide_index=True,
     column_config={
         "Current Price": st.column_config.NumberColumn(format="%.2f"),
-        "30D Forecast": st.column_config.NumberColumn(format="%.2f"),
-        "30D Profit/Share": st.column_config.NumberColumn(format="%.2f"),
+        "30-session forecast": st.column_config.NumberColumn(format="%.2f"),
+        "30-session change/share": st.column_config.NumberColumn(format="%.2f"),
         "Analyst Target": st.column_config.NumberColumn(format="%.2f"),
         "Analyst Profit/Share": st.column_config.NumberColumn(format="%.2f"),
         "P/E": st.column_config.NumberColumn(format="%.1f"),

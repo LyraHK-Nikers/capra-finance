@@ -19,6 +19,30 @@ class DCFTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]['rev'], 880)
         self.assertAlmostEqual(rows[1]['g'], -.11)
 
+    def test_terminal_rebuild_uses_stable_year_six_working_capital(self):
+        a = dict(ASSUMPTIONS, taper=0., nwc=.2)
+        d = _dcf(dict(BASE, g1=.20), a)
+        last = d['pr'][-1]
+        rev6 = last['rev'] * 1.025
+        expected = rev6 * (.2 * .8 + .03 - .04) - (rev6-last['rev'])*.2
+        self.assertAlmostEqual(d['terminal_fcf'], expected)
+        self.assertAlmostEqual(d['pvtv'], expected/.075/1.1**5)
+        self.assertNotAlmostEqual(expected, last['fcf']*1.025)
+
+    def test_pence_quotes_match_pound_economic_value(self):
+        pounds = dict(BASE, currency='GBP', financial_currency='GBP')
+        pence = dict(pounds, currency='GBp', price=BASE['price']*100)
+        self.assertEqual(_dcf_missing_inputs(pence), [])
+        self.assertAlmostEqual(_dcf(pence, ASSUMPTIONS)['ps'], _dcf(pounds, ASSUMPTIONS)['ps']*100)
+        self.assertAlmostEqual(_dcf(pence, ASSUMPTIONS)['upside'], _dcf(pounds, ASSUMPTIONS)['upside'])
+        self.assertAlmostEqual(_capm_wacc(pounds,.04,.05,.2), _capm_wacc(pence,.04,.05,.2))
+
+    def test_arithmetic_api_rejects_currency_mismatch(self):
+        self.assertTrue(_dcf(dict(BASE, financial_currency='EUR'), ASSUMPTIONS)['error'])
+
+    def test_extreme_growth_does_not_render_infinite_target(self):
+        self.assertTrue(_dcf(dict(BASE, g1=1e308), ASSUMPTIONS)['error'])
+
     def test_growth_tapers_from_either_direction(self):
         self.assertEqual([round(r['g'], 3) for r in _dcf_project(BASE, ASSUMPTIONS)],
                          [.05, .04, .03, .025, .025])

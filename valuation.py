@@ -17,6 +17,11 @@ def _first_finite(*values):
     return next((float(v) for v in values if _finite(v)), None)
 
 
+def _quote_unit(currency):
+    """Yahoo quotes some exchanges in minor units; statements use major units."""
+    return {"GBp": ("GBP", .01), "GBX": ("GBP", .01), "ZAc": ("ZAR", .01)}.get(currency, (currency, 1.0))
+
+
 def _annual_calibration(income, cashflow):
     """Use one matching annual period for operating margin, D&A and capex ratios."""
     if income is None or cashflow is None or income.empty or cashflow.empty:
@@ -61,7 +66,7 @@ def _dcf_missing_inputs(base):
     if not base.get("currency"):
         missing.append("quote currency")
     if (base.get("financial_currency") and base.get("currency") and
-            base["financial_currency"] != base["currency"]):
+            base["financial_currency"] != _quote_unit(base["currency"])[0]):
         missing.append("matching quote / financial currencies (FX conversion required)")
     return missing
 
@@ -86,7 +91,7 @@ def _dcf_project(base, a):
 
 def _dcf(base, a):
     nan = float("nan")
-    out = dict(pr=[], sumpv=nan, pvtv=nan, ev=nan, netDebt=nan, eq=nan,
+    out = dict(pr=[], terminal_fcf=nan, sumpv=nan, pvtv=nan, ev=nan, netDebt=nan, eq=nan,
                ps=nan, upside=nan, tvShare=nan, error="")
     if any(not _finite(base.get(k)) for k in ["rev", "margin", "g1", "debt", "cash", "shares", "price"]):
         out["error"] = "Missing or non-finite financial input."
@@ -96,23 +101,43 @@ def _dcf(base, a):
         return out
     if (min(base["rev"], base["shares"], base["price"]) <= 0 or min(base["debt"], base["cash"]) < 0
             or not 0 <= a["tax"] <= 1 or min(a["da"], a["capex"], a["taper"]) < 0
-            or min(base["g1"], a["termg"]) <= -1 or a["wacc"] <= 0):
+            or min(base["g1"], a["termg"]) <= -1 or not 0 < a["wacc"] <= 1):
         out["error"] = "Invalid financial input or forecast assumption."
         return out
     if a["wacc"] - a["termg"] < 0.005 - 1e-12:
         out["error"] = "Discount rate must exceed terminal growth by at least 0.5 percentage points."
         return out
+    if (base.get("financial_currency") and base.get("currency") and
+            base["financial_currency"] != _quote_unit(base["currency"])[0]):
+        out["error"] = "Quote and statement currencies differ; FX conversion is required."
+        return out
     pr = _dcf_project(base, a)
     out["pr"] = pr
-    if pr[-1]["fcf"] <= 0:
+    if any(not _finite(v) for row in pr for v in row.values()):
+        out["error"] = "Forecast inputs produce non-finite cash flows. Reduce the assumptions."
+        return out
+    # Rebuild year six at stable growth. Growing Y5 FCF would carry its old
+    # working-capital investment into perpetuity when Y5 growth is still fading.
+    rev6 = pr[-1]["rev"] * (1 + a["termg"])
+    ebit6 = rev6 * base["margin"]
+    terminal_fcf = (ebit6 - max(ebit6, 0) * a["tax"] + rev6 * (a["da"] - a["capex"])
+                    - (rev6 - pr[-1]["rev"]) * a["nwc"])
+    out["terminal_fcf"] = terminal_fcf
+    if not _finite(terminal_fcf):
+        out["error"] = "Terminal cash flow is non-finite. Reduce the assumptions."
+        return out
+    if terminal_fcf <= 0:
         out["error"] = "Terminal cash flow is not positive. A recovery model is required before using perpetual growth."
         return out
     sumpv = sum(r["fcf"] / (1 + a["wacc"]) ** r["t"] for r in pr)
-    pvtv = pr[-1]["fcf"] * (1 + a["termg"]) / (a["wacc"] - a["termg"]) / (1 + a["wacc"]) ** 5
+    pvtv = terminal_fcf / (a["wacc"] - a["termg"]) / (1 + a["wacc"]) ** 5
     ev = sumpv + pvtv
     nd = base["debt"] - base["cash"]
     eq = ev - nd
-    ps = eq / base["shares"]
+    ps = eq / base["shares"] / _quote_unit(base.get("currency"))[1]
+    if not all(_finite(v) for v in [sumpv, pvtv, ev, eq, ps]):
+        out["error"] = "Valuation exceeds the supported numeric range. Reduce the assumptions."
+        return out
     out.update(sumpv=sumpv, pvtv=pvtv, ev=ev, netDebt=nd, eq=eq, ps=ps,
                upside=ps / base["price"] - 1, tvShare=pvtv / ev if ev else nan)
     return out
@@ -131,7 +156,7 @@ def _capm_wacc(base, rf, erp, tax):
     if not all(_finite(x) for x in [beta, rf, erp, tax, base.get("price"), base.get("shares"), base.get("debt")]):
         return float("nan")
     ke = rf + beta * erp
-    e, d = base["price"] * base["shares"], max(0.0, base["debt"])
+    e, d = base["price"] * _quote_unit(base.get("currency"))[1] * base["shares"], max(0.0, base["debt"])
     if e <= 0 or not 0 <= tax <= 1:
         return float("nan")
     # Credit spread is an explicit approximation, not a quoted borrowing yield.

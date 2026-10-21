@@ -2,6 +2,7 @@
 import math
 from numbers import Real
 import pandas as pd
+from valuation import _quote_unit
 
 
 def number(x):
@@ -88,17 +89,26 @@ def enrich_info(info, fin, fast=None):
     equity, ed = bal('Stockholders Equity', 'Common Stock Equity')
     assets, ad = bal('Current Assets')
     liabilities, ld = bal('Current Liabilities')
-    put('totalDebt', debt)
-    put('totalCash', cash)
+    # Fill the net-debt pair from a common balance date, never two different years.
+    if out.get('totalDebt') is None or out.get('totalCash') is None:
+        debts = series(bs, 'Total Debt')
+        cashes = series(bs, 'Cash Cash Equivalents And Short Term Investments', 'Cash And Cash Equivalents')
+        common_balance = debts.index.intersection(cashes.index)
+        if len(common_balance):
+            balance_date = common_balance.max()
+            out['totalDebt'] = float(debts.loc[balance_date])
+            out['totalCash'] = float(cashes.loc[balance_date])
+            derived.extend(['totalDebt','totalCash'])
+            out['_balance_period'] = str(balance_date)[:10]
     put('debtToEquity', debt / equity * 100 if debt is not None and equity and equity > 0 and bd == ed else None)
     put('currentRatio', assets / liabilities if assets is not None and liabilities and liabilities > 0 and ad == ld else None)
     put('sharesOutstanding', bal('Ordinary Shares Number')[0])
     price, shares = out.get('currentPrice') or out.get('regularMarketPrice'), out.get('sharesOutstanding')
     if number(price) and number(shares) and price > 0 and shares > 0:
-        put('marketCap', price * shares)
+        put('marketCap', price * shares * _quote_unit(out.get('currency'))[1])
     # Derived multiples explicitly use the reported annual period, not TTM EPS.
     cap = out.get('marketCap')
-    currency_match = out.get('financialCurrency') and out.get('financialCurrency') == out.get('currency')
+    currency_match = out.get('financialCurrency') and out.get('financialCurrency') == _quote_unit(out.get('currency'))[0]
     put('annualPE', cap / ni if currency_match and number(cap) and ni is not None and ni > 0 else None)
     if currency_match and number(cap) and equity and equity > 0:
         put('priceToBook', cap / equity)
@@ -117,6 +127,9 @@ def business_view(rows):
     if not len(common):
         return None
     d = common.max()
+    latest_revenue = rows['Revenue'].index.max()
+    if (latest_revenue - d).days > 120:
+        return None  # do not silently rank using older complete statements
     rev = rows['Revenue'].loc[d]
     if rev <= 0:
         return None

@@ -49,6 +49,14 @@ Then open http://localhost:8501
 4. Deploy.
 # October 2026 reliability and comparison update
 
+Follow-up audit fixes: terminal cash flow is rebuilt in year six with stable
+growth and matching working capital, rather than growing the previous year's
+cash flow. See [terminal value methodology](https://pages.stern.nyu.edu/~adamodar/New_Home_Page/valquestions/termvalapproaches.htm).
+Pence quotes convert correctly to pounds; portfolio totals are grouped by currency
+and suppressed if quotes are incomplete. Short histories no longer masquerade as
+full multi-year CAGR. A GitHub Actions workflow runs the offline regression suite
+on each push and pull request.
+
 - Compare Stocks is the landing page, with two companies alongside each other, a
   four-measure business preference, three fiscal years of P&L and cash flow, YoY
   growth and downloadable CSV tables. Each company's fiscal dates are visible.

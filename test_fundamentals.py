@@ -39,6 +39,20 @@ class FundamentalsTests(unittest.TestCase):
     def test_currency_mismatch_does_not_generate_multiple(self):
         info=enrich_info({'financialCurrency':'USD'},fixture(),{'currency':'HKD','currentPrice':10.,'sharesOutstanding':50.})
         self.assertIsNone(info.get('annualPE'))
+    def test_pence_market_cap_is_in_pounds(self):
+        info=enrich_info({'financialCurrency':'GBP'},fixture(),{'currency':'GBp','currentPrice':1000.,'sharesOutstanding':50.})
+        self.assertEqual(info['marketCap'],500.)
+        self.assertEqual(info['annualPE'],5.)
+    def test_stale_complete_year_not_ranked_over_latest_income(self):
+        fin=fixture()
+        fin['cashflow']=fin['cashflow'].drop(columns=pd.Timestamp('2025-12-31'))
+        self.assertIsNone(__import__('fundamentals').business_view(annual_rows(fin)))
+    def test_net_debt_fallback_never_mixes_periods(self):
+        fin=fixture()
+        fin['balance'].loc['Total Debt',pd.Timestamp('2025-12-31')]=float('nan')
+        info=enrich_info({},fin)
+        self.assertEqual(info['_balance_period'],'2024-12-31')
+        self.assertEqual((info['totalDebt'],info['totalCash']),(220,40))
     def test_growth_matches_chosen_flow_period(self):
         fin=fixture()
         fin['cashflow']=fin['cashflow'].drop(columns=pd.Timestamp('2025-12-31'))

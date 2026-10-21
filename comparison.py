@@ -2,7 +2,7 @@
 import pandas as pd
 import streamlit as st
 from fundamentals import annual_rows, business_view, growth, number
-from valuation import DCF_DEFAULTS, _dcf, _dcf_missing_inputs
+from valuation import DCF_DEFAULTS, _dcf, _dcf_missing_inputs, _quote_unit
 
 
 def money(v):
@@ -17,6 +17,9 @@ def preference(left, right, names):
     views = [business_view(left), business_view(right)]
     if any(v is None for v in views):
         return 'No preference yet — complete annual revenue, profit and cash-flow history is needed.'
+    today = pd.Timestamp.now().normalize()
+    if any((today - v['date']).days > 730 for v in views):
+        return 'No preference yet — financial statements are more than two years old.'
     if abs((views[0]['date'] - views[1]['date']).days) > 120:
         return 'No preference yet — the latest fiscal years are too far apart for a fair comparison.'
     wins = [0, 0]
@@ -122,8 +125,10 @@ def render_comparison(fetch_info, fetch_statements, fetch_base):
                     continue
                 missing = _dcf_missing_inputs(base)
                 if not base.get('financial_currency'):
-                    if not st.checkbox(f"I verified {sym} statements are in {base.get('currency') or 'the quote currency'}", key='cmp_currency_'+sym):
+                    if not st.checkbox(f"I verified {sym} statements are in {_quote_unit(base.get('currency'))[0] or 'the quote currency'}", key='cmp_currency_'+sym):
                         missing.append('verified financial currency')
+                    else:
+                        base = dict(base, financial_currency=_quote_unit(base.get('currency'))[0])
                 if missing:
                     st.info('No price target. Missing: ' + ', '.join(missing))
                     continue
