@@ -49,6 +49,18 @@ Then open http://localhost:8501
 4. Deploy.
 # October 2026 reliability and comparison update
 
+## Top 5 Buy Ideas
+
+The new page screens a disclosed 32-company US universe and shows up to five ideas
+for each of Balanced, Conservative and Higher-risk Recovery. It refreshes public
+financial snapshots every 30 minutes, checks recent quarterly sales, verifies
+reporting currency, and dates the annual accounts and balance sheet. It does not
+force missing slots or treat an EPS beat / price collapse as sufficient evidence.
+Each idea includes reasons, risks and a research entry range when the DCF inputs
+support one. Recovery candidates with operating losses need a separate recovery
+forecast instead of a fabricated price target. Screen weights and exclusions are
+visible on the page; the lists are research screens, not personalised advice.
+
 Follow-up audit fixes: terminal cash flow is rebuilt in year six with stable
 growth and matching working capital, rather than growing the previous year's
 cash flow. See [terminal value methodology](https://pages.stern.nyu.edu/~adamodar/New_Home_Page/valquestions/termvalapproaches.htm).

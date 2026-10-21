@@ -34,6 +34,7 @@ from sklearn.linear_model import LinearRegression
 
 import auth
 from portfolio import render_portfolio
+from stock_ideas import render_stock_ideas, currency_from_payload
 from fundamentals import enrich_info, annual_rows, series as statement_series
 from comparison import render_comparison
 from valuation import (DCF_DEFAULTS, _finite, _first_finite, _annual_calibration,
@@ -1604,6 +1605,54 @@ def fetch_valuation_base(ticker: str) -> dict | None:
         "pe": _first_finite(info.get("trailingPE"), info.get("annualPE")), "ev_ebitda": info.get("enterpriseToEbitda"),
         "sector": info.get("sector") or "—", "beta": _first_finite(info.get("beta")),
     }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_idea_snapshot(ticker: str) -> dict:
+    """Public market data only; share caches with comparison and analyzer pages."""
+    info = fetch_info(ticker)
+    fin = fetch_financial_statements(ticker)
+    tk = yf.Ticker(ticker)
+    try:
+        quarterly = tk.quarterly_income_stmt
+    except Exception:
+        quarterly = None
+    balance_date=None
+    for candidate in ['quarterly_balance_sheet','balance_sheet']:
+        try:
+            balance=getattr(tk,candidate)
+            debts=statement_series(balance,'Total Debt')
+            cashes=statement_series(balance,'Cash Cash Equivalents And Short Term Investments','Cash And Cash Equivalents')
+            common=debts.index.intersection(cashes.index)
+            if len(common):
+                date=common.max()
+                info=dict(info,totalDebt=float(debts.loc[date]),totalCash=float(cashes.loc[date]))
+                balance_date=str(date)[:10]
+                break
+        except Exception:
+            pass
+    currency = info.get('financialCurrency')
+    if not currency:
+        import urllib.parse
+        end = int(datetime.now(timezone.utc).timestamp())
+        url = ('https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/'
+               + urllib.parse.quote(ticker) + '?symbol=' + urllib.parse.quote(ticker)
+               + '&type=annualTotalRevenue&period1=' + str(end-3*366*86400) + '&period2=' + str(end))
+        try:
+            currency = currency_from_payload(_http_get_json(url,timeout=8))
+        except Exception:
+            try:
+                from curl_cffi import requests as market_requests
+                response = market_requests.get(url,impersonate='chrome',timeout=8)
+                response.raise_for_status()
+                currency = currency_from_payload(response.json())
+            except Exception:
+                currency = None
+    base=fetch_valuation_base(ticker)
+    if base and balance_date:
+        base=dict(base,debt=info['totalDebt'],cash=info['totalCash'])
+    return dict(symbol=ticker,info=info,financials=fin,base=base,
+                quarterly_income=quarterly,statement_currency=currency,balance_date=balance_date)
 
 
 def _sensitivity_heatmap(base, a, mode: str):
@@ -3272,7 +3321,7 @@ if _auth_on:
 
 # Page selector — tab-style. Markets page renders + st.stop()s so the existing
 # stock pipeline below only executes when on the Stocks view.
-_views = ["⚖️ Compare Stocks", "📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer"]
+_views = ["⚖️ Compare Stocks", "🌟 Top 5 Buy Ideas", "📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer"]
 if _is_admin:
     _views.append("🛡️ Admin")
 _active_view = st.radio(
@@ -3282,6 +3331,9 @@ _active_view = st.radio(
     label_visibility="collapsed",
     key="active_view",
 )
+if _active_view == "🌟 Top 5 Buy Ideas":
+    render_stock_ideas(fetch_idea_snapshot, fetch_history)
+    st.stop()
 if _active_view == "⚖️ Compare Stocks":
     render_comparison(fetch_info, fetch_financial_statements, fetch_valuation_base)
     st.stop()
