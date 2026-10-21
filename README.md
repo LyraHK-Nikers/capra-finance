@@ -8,6 +8,30 @@ A global market-intelligence dashboard built with Streamlit.
 
 Data via Yahoo Finance. For research and education only — not investment advice.
 
+## Valuation behavior
+
+- DCF inputs remain unavailable when financial data is missing. Net income, debt,
+  cash and growth are never invented from generic margins or earnings growth.
+- D&A and capital-spending starting ratios use the same annual statement period.
+  That period is displayed. Other forecast assumptions remain editable.
+- Negative initial revenue growth stays negative and approaches terminal growth
+  gradually. The main model, sensitivity tables and reverse DCF use one calculation.
+- A missing beta disables the CAPM estimate. Users can explicitly select a manual
+  discount rate. Currency mismatches require conversion before valuation.
+- A nonpositive terminal cash flow needs a recovery model. A perpetual-growth
+  target is not generated. The discount rate must exceed terminal growth by 0.5pp.
+- Health verdicts and buy labels are withheld when financial coverage is incomplete.
+- The DCF comparison describes selected assumptions, not an automatic recommendation.
+
+Offline regression tests:
+
+```bash
+python -m unittest test_valuation test_valuation_data -v
+```
+
+With the app dependencies installed, also run `python -m unittest test_valuation_ui -v`
+to verify the real Streamlit valuation controls with offline fixtures.
+
 ## Run locally
 
 ```bash

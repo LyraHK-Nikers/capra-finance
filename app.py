@@ -33,6 +33,9 @@ from plotly.subplots import make_subplots
 from sklearn.linear_model import LinearRegression
 
 import auth
+from valuation import (DCF_DEFAULTS, _finite, _first_finite, _annual_calibration,
+                       _dcf_missing_inputs, _dcf_project, _dcf, _dcf_price_gm,
+                       _dcf_price_w, _capm_wacc, _implied_growth, _health_verdict)
 from tickers import MARKET_PRESETS, NASDAQ_TRADER_SOURCES, WIKIPEDIA_INDEX_SOURCES
 
 STORAGE_PATH = Path(__file__).parent / "user_state.json"
@@ -802,21 +805,20 @@ def compute_metrics(
         rsi_14=rsi,
     )
     score, rec = _best_buy_score(metrics_dict)
+    if not (all(_finite(info.get(k)) for k in ["totalRevenue", "operatingCashflow"])
+            and _first_finite(info.get("netIncomeToCommon"), info.get("netIncome")) is not None):
+        rec = "Insufficient data"
 
     # Financial KPIs from the info dict — already fetched, so no extra HTTP call.
     annual_rev = info.get("totalRevenue")
     rev_yoy = info.get("revenueGrowth")  # TTM YoY (decimal, e.g. 0.12 = +12%)
-    net_inc = info.get("netIncomeToCommon") or info.get("netIncome")
+    net_inc = _first_finite(info.get("netIncomeToCommon"), info.get("netIncome"))
     # earningsGrowth is often null for loss-making firms; fall back to the
     # quarterly YoY earnings growth when available.
     earn_yoy = info.get("earningsGrowth")
     if earn_yoy is None:
         earn_yoy = info.get("earningsQuarterlyGrowth")
-    qoq_sales = (
-        info.get("quarterlyRevenueGrowth")
-        or info.get("revenueQuarterlyGrowth")
-        or info.get("earningsQuarterlyGrowth")
-    )
+    qoq_sales = _first_finite(info.get("quarterlyRevenueGrowth"), info.get("revenueQuarterlyGrowth"))
     market_cap_val = info.get("marketCap")
     cap_cat = _cap_category(market_cap_val)
 
@@ -1469,249 +1471,82 @@ def _symbol_in_markets(symbol: str, markets: list[str]) -> bool:
 # Faithful port of the live-stock-valuation model.
 # ---------------------------------------------------------------------------
 
-# Default DCF assumptions (same as the source model).
-DCF_DEFAULTS = {"tax": 0.18, "wacc": 0.09, "termg": 0.035,
-                "da": 0.07, "capex": 0.12, "nwc": 0.02, "taper": 0.02}
-
-
-def _dcf_project(base: dict, a: dict) -> list[dict]:
-    """5-year revenue → FCF projection. Growth tapers toward terminal growth."""
-    rows, prev = [], base["rev"]
-    for t in range(1, 6):
-        g = max(a["termg"], base["g1"] - (t - 1) * a["taper"])
-        rev = prev * (1 + g)
-        ebit = rev * base["margin"]
-        nopat = ebit * (1 - a["tax"])
-        da, capex = rev * a["da"], rev * a["capex"]
-        nwc = (rev - prev) * a["nwc"]
-        rows.append({"t": t, "g": g, "rev": rev, "ebit": ebit,
-                     "da": da, "capex": capex, "nwc": nwc,
-                     "fcf": nopat + da - capex - nwc})
-        prev = rev
-    return rows
-
-
-def _dcf(base: dict, a: dict) -> dict:
-    pr = _dcf_project(base, a)
-    sumpv = sum(r["fcf"] / (1 + a["wacc"]) ** r["t"] for r in pr)
-    last = pr[-1]["fcf"]
-    if a["wacc"] <= a["termg"]:
-        return {"pr": pr, "sumpv": sumpv, "pvtv": float("nan"), "ev": float("nan"),
-                "netDebt": base["debt"] - base["cash"], "eq": float("nan"),
-                "ps": float("nan"), "upside": float("nan"), "tvShare": float("nan")}
-    tv = last * (1 + a["termg"]) / (a["wacc"] - a["termg"])
-    pvtv = tv / (1 + a["wacc"]) ** 5
-    ev = sumpv + pvtv
-    nd = base["debt"] - base["cash"]
-    eq = ev - nd
-    ps = eq / base["shares"] if base["shares"] else float("nan")
-    return {"pr": pr, "sumpv": sumpv, "pvtv": pvtv, "ev": ev, "netDebt": nd,
-            "eq": eq, "ps": ps, "upside": (ps / base["price"] - 1) if base["price"] else float("nan"),
-            "tvShare": pvtv / ev if ev else float("nan")}
-
-
-def _dcf_price_gm(base: dict, a: dict, g: float, m: float) -> float:
-    """DCF per-share holding growth g and margin m constant (sensitivity)."""
-    s, prev, last = 0.0, base["rev"], 0.0
-    for t in range(1, 6):
-        rev = prev * (1 + g)
-        fcf = rev * m * (1 - a["tax"]) + rev * a["da"] - rev * a["capex"] - (rev - prev) * a["nwc"]
-        s += fcf / (1 + a["wacc"]) ** t
-        last, prev = fcf, rev
-    if a["wacc"] <= a["termg"] or not base["shares"]:
-        return float("nan")
-    tv = last * (1 + a["termg"]) / (a["wacc"] - a["termg"])
-    return (s + tv / (1 + a["wacc"]) ** 5 - (base["debt"] - base["cash"])) / base["shares"]
-
-
-def _dcf_price_w(base: dict, a: dict, w: float, tg: float) -> float:
-    """DCF per-share varying WACC w and terminal growth tg (sensitivity)."""
-    pr = _dcf_project(base, a)
-    # Require a real spread between WACC and terminal growth, else the terminal term
-    # explodes toward ±inf and the heatmap cell becomes garbage.
-    if (w - tg) < 0.005 or not base["shares"]:
-        return float("nan")
-    s = sum(r["fcf"] / (1 + w) ** r["t"] for r in pr)
-    last = pr[-1]["fcf"]
-    val = (s + (last * (1 + tg) / (w - tg)) / (1 + w) ** 5 - (base["debt"] - base["cash"])) / base["shares"]
-    return val if math.isfinite(val) else float("nan")
-
-
-def _capm_wacc(base: dict, rf: float, erp: float, tax: float) -> float:
-    """Estimate WACC from CAPM: blend cost of equity (rf + β·ERP) with after-tax cost of debt."""
-    beta = base.get("beta") or 1.0
-    ke = rf + beta * erp
-    e = base["price"] * base["shares"]          # market value of equity
-    d = max(0.0, base["debt"])                   # book value of debt (proxy)
-    kd_after_tax = (rf + 0.015) * (1 - tax)      # cost of debt ≈ rf + credit spread
-    tot = e + d
-    if tot <= 0:
-        return max(0.05, min(0.20, ke))
-    wacc = (e / tot) * ke + (d / tot) * kd_after_tax
-    return max(0.05, min(0.20, wacc))
-
-
-def _implied_growth(base: dict, a: dict, lo: float = -0.5, hi: float = 1.0) -> tuple[float, str]:
-    """Reverse DCF: solve for the constant 5-yr growth the CURRENT PRICE implies.
-
-    Bisection only works while DCF price is monotonically INCREASING in growth, which
-    holds only when per-revenue free cash flow is positive. For unprofitable firms the
-    coefficient `margin·(1-tax) + D&A − capex` is ≤ 0, FCF goes more negative as growth
-    rises, and the solve would return a confidently-wrong number — so we bail to NaN.
-    Returns (growth, edge) where edge is 'below' / 'above' / 'exact'.
-    """
-    fcf_coef = base["margin"] * (1 - a["tax"]) + a["da"] - a["capex"]
-    if fcf_coef <= 0:
-        return float("nan"), "exact"  # non-monotonic regime → UI shows "—"
-    def f(g):  # DCF price at growth g (current margin) minus the market price
-        return _dcf_price_gm(base, a, g, base["margin"]) - base["price"]
-    flo, fhi = f(lo), f(hi)
-    if flo != flo or fhi != fhi:
-        return float("nan"), "exact"
-    if flo > 0:   # even at -50% growth the model exceeds price → market implies < -50%
-        return lo, "below"
-    if fhi < 0:   # even at +100% growth the model is below price → market implies > +100%
-        return hi, "above"
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        if f(mid) > 0:
-            hi = mid
-        else:
-            lo = mid
-    return (lo + hi) / 2, "exact"
-
-
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_valuation_base(ticker: str) -> dict | None:
-    """Pull the fundamentals the DCF needs from Yahoo — resilient to throttling.
+    """Fetch reported inputs. Preserve missing values instead of inventing profit/debt.
 
-    Tries .info first; when Yahoo rate-limits it (common on shared/cloud IPs),
-    falls back to fast_info, the income statement, the balance sheet, and price
-    history so the page still works. Returns None only if price/shares/revenue
-    can't be obtained from ANY source.
+    Historical D&A and capex ratios come from the same annual statement period.
+    They are starting assumptions, not a claim about future spending.
     """
     tk = yf.Ticker(ticker)
-
-    # 1) .info — retry once if it comes back empty (transient throttle).
-    info = {}
-    for attempt in range(2):
-        try:
-            info = tk.info or {}
-        except Exception:
-            info = {}
-        if info.get("currentPrice") or info.get("regularMarketPrice") or info.get("totalRevenue"):
-            break
-        if attempt == 0:
-            time.sleep(0.6)
-
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
-    shares = info.get("sharesOutstanding")
-    rev = info.get("totalRevenue")
-    margin = info.get("operatingMargins")
-    ni = info.get("netIncomeToCommon") or info.get("netIncome")
-    debt = info.get("totalDebt")
-    cash = info.get("totalCash")
-    g1 = info.get("revenueGrowth")
-    name = info.get("shortName") or info.get("longName")
-    currency = info.get("currency")
-    beta = info.get("beta")
-    pe = info.get("trailingPE")
-    ev_ebitda = info.get("enterpriseToEbitda")
-    sector = info.get("sector")
-
-    # 2) fast_info — lighter endpoint, often survives when .info is throttled.
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
     try:
         fi = tk.fast_info
-        def _fi(attr):
+        def fast(key):
             try:
-                return fi[attr] if hasattr(fi, "__getitem__") else getattr(fi, attr, None)
+                return fi[key]
             except Exception:
-                return getattr(fi, attr, None)
-        price = price or _fi("last_price") or _fi("lastPrice")
-        shares = shares or _fi("shares")
-        currency = currency or _fi("currency")
+                return None
+        price = _first_finite(info.get("currentPrice"), info.get("regularMarketPrice"), fast("last_price"))
+        shares = _first_finite(info.get("sharesOutstanding"), fast("shares"))
+        currency = info.get("currency") or fast("currency")
     except Exception:
-        pass
-
-    # 3) Price from recent history if still missing.
-    if not price:
+        price = _first_finite(info.get("currentPrice"), info.get("regularMarketPrice"))
+        shares = _first_finite(info.get("sharesOutstanding"))
+        currency = info.get("currency")
+    if price is None:
         try:
             h = fetch_history((ticker,), period="5d")
-            if not h.empty and ticker in h.columns:
-                s = h[ticker].dropna()
-                if not s.empty:
-                    price = float(s.iloc[-1])
+            if not h.empty and ticker in h.columns and not h[ticker].dropna().empty:
+                price = float(h[ticker].dropna().iloc[-1])
         except Exception:
             pass
-
-    # 4) Income statement — revenue / margin / net income / YoY growth.
-    if (not rev) or (margin is None) or (not ni) or (g1 is None):
-        try:
-            inc = tk.income_stmt
-        except Exception:
-            inc = None
-        if inc is not None and not getattr(inc, "empty", True):
-            def _row(label):
-                try:
-                    return float(inc.loc[label].iloc[0]) if label in inc.index else None
-                except Exception:
-                    return None
-            rev = rev or _row("Total Revenue") or _row("Operating Revenue")
-            op_inc = _row("Operating Income")
-            ni = ni or _row("Net Income") or _row("Net Income Common Stockholders")
-            if margin is None and rev and op_inc:
-                margin = op_inc / rev
-            if g1 is None and "Total Revenue" in inc.index and inc.shape[1] >= 2:
-                try:
-                    r0, r1 = inc.loc["Total Revenue"].iloc[0], inc.loc["Total Revenue"].iloc[1]
-                    if r1:
-                        g1 = float(r0 / r1 - 1)
-                except Exception:
-                    pass
-
-    # 5) Balance sheet — debt / cash if missing.
+    try:
+        inc = tk.income_stmt
+    except Exception:
+        inc = None
+    try:
+        cfs = tk.cashflow
+    except Exception:
+        cfs = None
+    calibration = _annual_calibration(inc, cfs)
+    debt, cash = _first_finite(info.get("totalDebt")), _first_finite(info.get("totalCash"))
     if debt is None or cash is None:
-        try:
-            bs = tk.balance_sheet
-            if bs is not None and not getattr(bs, "empty", True):
-                def _b(label):
-                    try:
-                        return float(bs.loc[label].iloc[0]) if label in bs.index else None
-                    except Exception:
-                        return None
-                if debt is None:
-                    debt = _b("Total Debt")
-                if cash is None:
-                    cash = _b("Cash And Cash Equivalents") or _b("Cash Cash Equivalents And Short Term Investments")
-        except Exception:
-            pass
-
-    # Must have the three essentials from somewhere.
-    if not (price and shares and rev):
-        return None
-
-    margin = margin if margin is not None else (info.get("profitMargins") or 0.10)
-    g1 = g1 if g1 is not None else (info.get("earningsGrowth") or 0.08)
-    # Only synthesize net income when margin is genuinely positive — never force a
-    # loss-maker to look profitable (that would fabricate a positive P/E in comps).
-    if ni is None:
-        ni = rev * margin * 0.8 if margin > 0 else float("nan")
-
+        for attr in ["quarterly_balance_sheet", "balance_sheet"]:
+            try:
+                bs = getattr(tk, attr)
+                if bs is None or bs.empty:
+                    continue
+                # Use one common balance-sheet date when Yahoo's quote data is incomplete.
+                for col in sorted(bs.columns, reverse=True):
+                    def balance(*labels):
+                        return _first_finite(*(bs.loc[label, col] for label in labels if label in bs.index))
+                    bd = balance("Total Debt")
+                    bc = balance("Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents")
+                    if bd is not None and bc is not None:
+                        debt, cash = bd, bc
+                        break
+                if debt is not None and cash is not None:
+                    break
+            except Exception:
+                pass
+    ni = _first_finite(info.get("netIncomeToCommon"), info.get("netIncome"))
     return {
-        "name": name or ticker,
-        "price": float(price),
-        "shares": float(shares),
-        "rev": float(rev),
-        "margin": float(margin),
-        "ni": float(ni),
-        "debt": float(debt or 0),
-        "cash": float(cash or 0),
-        "g1": float(g1),
-        "currency": currency or "USD",
-        "pe": pe,
-        "ev_ebitda": ev_ebitda,
-        "sector": sector or "—",
-        "beta": beta,
+        "name": info.get("shortName") or info.get("longName") or ticker,
+        "price": price, "shares": shares,
+        "rev": _first_finite(info.get("totalRevenue"), calibration.get("annual_revenue")),
+        "margin": _first_finite(info.get("operatingMargins"), calibration.get("margin")),
+        "ni": ni if ni is not None else float("nan"),
+        "debt": debt, "cash": cash,
+        "g1": _first_finite(info.get("revenueGrowth"), calibration.get("growth")),
+        "da": calibration.get("da"), "capex": calibration.get("capex"),
+        "calibration_period": calibration.get("calibration_period"),
+        "currency": currency, "financial_currency": info.get("financialCurrency"),
+        "pe": info.get("trailingPE"), "ev_ebitda": info.get("enterpriseToEbitda"),
+        "sector": info.get("sector") or "—", "beta": _first_finite(info.get("beta")),
     }
 
 
@@ -1719,9 +1554,9 @@ def _sensitivity_heatmap(base, a, mode: str):
     """Plotly heatmap of DCF price across a 2-D assumption grid."""
     if mode == "gm":
         rows = [base["margin"] + d for d in (-0.04, -0.02, 0, 0.02, 0.04)]
-        cols = [max(0.0, base["g1"] + d) for d in (-0.06, -0.03, 0, 0.03, 0.06)]
+        cols = [base["g1"] + d for d in (-0.06, -0.03, 0, 0.03, 0.06)]
         z = [[_dcf_price_gm(base, a, g, m) for g in cols] for m in rows]
-        x_title, y_title = "Revenue growth →", "Op margin ↓"
+        x_title, y_title = "Initial revenue growth →", "Op margin ↓"
         x_labels = [f"{g*100:.0f}%" for g in cols]
         y_labels = [f"{m*100:.0f}%" for m in rows]
         title = "Sensitivity · Growth × Margin"
@@ -1801,7 +1636,7 @@ def fetch_analyzer_data(ticker: str) -> dict | None:
         return None
 
     de = info.get("debtToEquity")
-    if de is not None and de > 5:   # yfinance reports D/E as a percent (e.g. 150 = 1.5)
+    if de is not None:   # yfinance reports D/E as a percent, including values below 5
         de = de / 100.0
 
     d = {
@@ -2070,7 +1905,7 @@ def render_analyzer_body(chosen: str) -> None:
     cat_rating = {}
     for cat, rws in sections.items():
         scored = [_AN_SCORE[r["rating"]] for r in rws if r["rating"] in _AN_SCORE]
-        if not scored:
+        if len(scored) < math.ceil(len(rws) / 2):
             cat_rating[cat] = "na"
         else:
             avg = sum(scored) / len(scored)
@@ -2079,17 +1914,11 @@ def render_analyzer_body(chosen: str) -> None:
     reds = sum(1 for v in cat_rating.values() if v == "bad")
 
     # ---- Plain-English verdict ----
-    if greens >= 4 and reds == 0:
-        head = f"**{d['name']}** looks financially strong."
-    elif greens >= reds and reds <= 1:
-        head = f"**{d['name']}** looks reasonably healthy, with a few things to watch."
-    elif reds >= 3:
-        head = f"**{d['name']}** shows several warning signs — dig in carefully."
-    else:
-        head = f"**{d['name']}** is a mixed picture."
+    head = _health_verdict(d["name"], cat_rating)
+    covered = sum(v != "na" for v in cat_rating.values())
     green_cats = [c for c, v in cat_rating.items() if v == "good"]
     red_cats = [c for c, v in cat_rating.items() if v == "bad"]
-    bits = [head, f"{greens} of 5 areas scored green and {reds} scored red."]
+    bits = [head, f"{covered} of 5 areas have sufficient data. {greens} green, {reds} red."]
     if green_cats:
         bits.append(f"Strengths: {', '.join(green_cats)}.")
     if red_cats:
@@ -2173,8 +2002,10 @@ def render_analyzer_body(chosen: str) -> None:
     if flags:
         for f in flags:
             st.markdown(f"⚠️ {f}")
+    elif any(len(d.get(key, [])) < 2 for key in ["rev_series", "ni_series", "fcf_series"]):
+        st.info("Insufficient financial history to complete the red-flag checks.")
     else:
-        st.success("✅ No major red flags detected in the patterns we check.")
+        st.success("No major red flags detected in the available financial history.")
 
     st.divider()
     st.caption(
@@ -2201,7 +2032,7 @@ check whether the expectations baked into today's price are realistic.
 |---|---|---|
 | **DCF Fair Value** | What a share is worth based on projected future cash flows | Compare to the current price |
 | **Upside / (Downside)** | Gap between fair value and price | Roughly: > **+25%** looks cheap, < **−25%** looks expensive — *if the assumptions hold* |
-| **DCF Signal** | Mechanical Buy → Sell read from the upside | A starting point, **not** a verdict |
+| **Model comparison** | Price compared with value under your selected assumptions | Not an automatic buy or sell recommendation |
 | **Price-vs-Fair-Value gauge** | Where the price sits in the under/overvalued zones | Needle in the green zone = trading below fair value |
 
 #### 🔄 Reverse DCF — the most important sanity check
@@ -2269,7 +2100,18 @@ A narrow range = robust thesis; a wild range = fragile.
             st.rerun()
         return
 
+    missing = _dcf_missing_inputs(base)
+    if missing:
+        st.warning("DCF unavailable. Missing or incompatible inputs: " + ", ".join(missing) + ". No valuation or buy signal is generated.")
+        if st.button("Retry financial data", key="val_missing_retry"):
+            fetch_valuation_base.clear()
+            st.rerun()
+        return
+    base = dict(base)  # sliders must not mutate the cached reported inputs
     cur = base["currency"]
+    st.caption(f"D&A and capex ratios start from annual statements ending {base['calibration_period']}. "
+               "Tax, working capital, growth taper and terminal growth are model assumptions. "
+               "Confirm that cash added back excludes customer funds and operating cash requirements.")
 
     # --- Live quote header (current price, today's move, trend) ----------
     _vhist = fetch_history((chosen,), period="6mo")
@@ -2304,42 +2146,43 @@ A narrow range = robust thesis; a wild range = fragile.
 
     # --- Assumptions (editable) -----------------------------------------
     with st.expander("⚙️ Assumptions — tune the model", expanded=False):
-        st.caption("WACC ≈ the yearly return investors demand (~7–10%). "
-                   "Terminal growth = assumed growth forever after year 5.")
-        a = dict(DCF_DEFAULTS)
+        st.caption("Percent inputs are editable forecasts. WACC is the discount rate. Terminal growth applies after year five.")
+        a = dict(DCF_DEFAULTS, da=base["da"], capex=base["capex"])
         ac1, ac2, ac3 = st.columns(3)
-        base["g1"] = ac1.slider("Year-1 revenue growth", -0.20, 0.60, float(round(base["g1"], 3)), 0.01)
-        base["margin"] = ac1.slider("Operating margin", -0.10, 0.70, float(round(base["margin"], 3)), 0.01)
-        a["taper"] = ac1.slider("Growth taper / yr", 0.0, 0.10, a["taper"], 0.005)
-        a["tax"] = ac2.slider("Tax rate", 0.0, 0.40, a["tax"], 0.01)
-        rf = ac2.slider("Risk-free rate", 0.0, 0.07, 0.04, 0.005, help="~10-yr govt bond yield")
-        erp = ac2.slider("Equity risk premium", 0.03, 0.08, 0.05, 0.005)
-        a["termg"] = ac3.slider("Terminal growth", 0.0, 0.05, a["termg"], 0.005)
-        a["da"] = ac3.slider("D&A % of revenue", 0.0, 0.20, a["da"], 0.01)
-        a["capex"] = ac3.slider("Capex % of revenue", 0.0, 0.30, a["capex"], 0.01)
-        a["nwc"] = ac3.slider("ΔNWC % of revenue change", 0.0, 0.15, a["nwc"], 0.01)
-
-        # --- WACC: CAPM-estimated by default, with manual override ----------
+        base["g1"] = ac1.number_input("Year-1 revenue growth (%)", value=float(base["g1"] * 100), step=0.5, key=f"val_growth_{chosen}") / 100
+        base["margin"] = ac1.number_input("Operating margin (%)", value=float(base["margin"] * 100), step=0.5, key=f"val_margin_{chosen}") / 100
+        a["taper"] = ac1.slider("Growth adjustment / year", 0.0, 0.10, a["taper"], 0.005, help="Approaches terminal growth from above or below, without changing year-one growth.")
+        a["tax"] = ac2.slider("Tax rate (assumption)", 0.0, 0.40, a["tax"], 0.01)
+        rf = ac2.slider("Risk-free rate (assumption)", 0.0, 0.07, 0.04, 0.005)
+        erp = ac2.slider("Equity risk premium (assumption)", 0.03, 0.08, 0.05, 0.005)
+        a["termg"] = ac3.slider("Terminal growth (assumption)", 0.0, 0.05, a["termg"], 0.005)
+        a["da"] = ac3.number_input("D&A / revenue (%)", min_value=0.0, value=float(a["da"] * 100), step=0.1, key=f"val_da_{chosen}") / 100
+        a["capex"] = ac3.number_input("Capex / revenue (%)", min_value=0.0, value=float(a["capex"] * 100), step=0.1, key=f"val_capex_{chosen}") / 100
+        a["nwc"] = ac3.slider("ΔNWC / revenue change (assumption)", 0.0, 0.15, a["nwc"], 0.01)
         capm = _capm_wacc(base, rf, erp, a["tax"])
-        beta_disp = base.get("beta")
-        beta_txt = f"β={beta_disp:.2f}" if beta_disp else "β≈1.0 (default)"
-        use_capm = st.checkbox(
-            f"📐 Use CAPM-estimated WACC: **{capm*100:.1f}%** ({beta_txt})",
-            value=True,
-            help="Cost of equity = risk-free + β × equity-risk-premium, blended with after-tax cost of debt.",
-        )
+        has_capm = _finite(capm) and capm > 0
+        if not has_capm:
+            st.info("CAPM estimate unavailable: missing beta or invalid inputs. Set a manual discount-rate assumption.")
+        use_capm = st.checkbox("Use estimated WACC" + (f" ({capm:.1%}, beta {base['beta']:.2f})" if has_capm else " — unavailable"),
+                               value=has_capm, disabled=not has_capm, key=f"val_use_capm_{chosen}")
+        st.caption("Estimated WACC uses book debt and a 1.5% credit-spread assumption. It is not an observed borrowing yield.")
         if use_capm:
             a["wacc"] = capm
         else:
-            a["wacc"] = st.slider("WACC (manual discount rate)", 0.05, 0.15, round(capm, 3), 0.005)
+            a["wacc"] = st.number_input("Manual discount rate (%)", min_value=0.1, max_value=50.0,
+                                         value=float(DCF_DEFAULTS["wacc"] * 100), step=0.5, key=f"val_wacc_{chosen}") / 100
 
     D = _dcf(base, a)
+    if D["error"]:
+        st.warning("DCF unavailable: " + D["error"])
+        return
+    if D["tvShare"] > 0.75:
+        st.caption(f"{D['tvShare']:.0%} of enterprise value comes from cash flows after year five. Review the sensitivity range.")
 
     # --- Verdict cards ---------------------------------------------------
     upside = D["upside"]
-    sig = ("Strong Buy" if upside >= 0.25 else "Buy" if upside >= 0.10 else
-           "Hold" if upside >= -0.10 else "Reduce" if upside >= -0.25 else "Sell") if upside == upside else "—"
-    sig_color = _rec_color(sig)
+    sig = "Below model value" if upside > 0.10 else "Above model value" if upside < -0.10 else "Near model value"
+    sig_color = "#10b981" if upside > 0.10 else "#ef4444" if upside < -0.10 else "#eab308"
     up_color = _color(upside)
 
     v = st.columns(4)
@@ -2349,8 +2192,8 @@ A narrow range = robust thesis; a wild range = fragile.
     v[3].markdown(
         f'<div class="gt-card" style="text-align:center;border:1px solid {sig_color}66;'
         f'background:linear-gradient(135deg,{sig_color}22,{sig_color}0a);">'
-        f'<div style="font-size:0.7rem;color:#cbd5e1;text-transform:uppercase;letter-spacing:0.05em;">DCF Signal</div>'
-        f'<div style="font-size:1.6rem;font-weight:800;color:{sig_color};margin-top:6px;text-shadow:0 0 12px {sig_color}55;">{sig}</div>'
+        f'<div style="font-size:0.7rem;color:#cbd5e1;text-transform:uppercase;letter-spacing:0.05em;">Under selected assumptions</div>'
+        f'<div style="font-size:1.1rem;font-weight:800;color:{sig_color};margin-top:6px;text-shadow:0 0 12px {sig_color}55;">{sig}</div>'
         f'<div style="color:#94a3b8;font-size:0.66rem;margin-top:4px;">{base["sector"]}</div>'
         f'</div>',
         unsafe_allow_html=True,
@@ -2401,9 +2244,7 @@ A narrow range = robust thesis; a wild range = fragile.
 
     # --- Reverse DCF — what growth the market is pricing in ---------------
     st.markdown("##### 🔄 Reverse DCF — what the market is pricing in")
-    st.caption("Holds today's price as fact and solves for the constant 5-year revenue growth "
-               "that justifies it. Compare it to the company's actual recent growth to judge if "
-               "the market's expectation is realistic.")
+    st.caption("Solves the initial revenue growth that matches today's price using the same taper, margins and discount assumptions as the main DCF.")
     implied_g, edge = _implied_growth(base, a)
     assumed_g = base["g1"]
     if edge == "above":
@@ -2419,18 +2260,18 @@ A narrow range = robust thesis; a wild range = fragile.
     if gap is None:
         verdict_txt, verdict_color = "—", "#9ca3af"
     elif gap > 0.02:
-        verdict_txt = "Market expects MORE growth than recent fundamentals — priced for optimism"
+        verdict_txt = "Market expects MORE growth than the selected assumptions — priced for optimism"
         verdict_color = "#f59e0b"
     elif gap < -0.02:
-        verdict_txt = "Market expects LESS growth than recent fundamentals — priced conservatively"
+        verdict_txt = "Market expects LESS growth than the selected assumptions — priced conservatively"
         verdict_color = "#10b981"
     else:
-        verdict_txt = "Market expectations roughly match recent growth — fairly priced"
+        verdict_txt = "Market expectations roughly match the selected growth assumption"
         verdict_color = "#ff9a5c"
 
     rc = st.columns(3)
-    rc[0].metric("Market-implied 5-yr growth", implied_str, help=implied_note)
-    rc[1].metric("Recent revenue growth (Yr-1)", f"{assumed_g*100:+.1f}%")
+    rc[0].metric("Market-implied initial growth", implied_str, help=implied_note)
+    rc[1].metric("Selected initial growth", f"{assumed_g*100:+.1f}%")
     rc[2].metric("Expectation gap", f"{gap*100:+.1f} pts" if gap is not None else "—",
                  help="Implied growth minus recent growth. Large positive = priced for optimism.")
     st.markdown(
@@ -2446,7 +2287,7 @@ A narrow range = robust thesis; a wild range = fragile.
         st.markdown("##### Discounted Cash Flow")
         waterfall = pd.DataFrame({
             "Item": ["Sum PV of 5-yr cash", "+ PV of terminal value", "= Enterprise value",
-                     "− Net debt", "= Equity value", "÷ Shares", "Fair value / share",
+                     "Cash less debt adjustment", "= Equity value", "÷ Shares", "Fair value / share",
                      "Current price", "Upside", "% from terminal value"],
             "Value": [
                 _money(D["sumpv"]), _money(D["pvtv"]), _money(D["ev"]),
@@ -2484,21 +2325,21 @@ A narrow range = robust thesis; a wild range = fragile.
     pr = D["pr"]
     cf = pd.DataFrame({"Line item": [
         "Revenue", "Revenue growth", "Operating income (EBIT)", "NOPAT (EBIT after tax)",
-        "(+) D&A", "(−) Capex", "(−) Δ Net working capital",
+        "(+) D&A", "Capital spending (cash outflow)", "Working-capital cash impact",
         "Free cash flow", "Discount factor", "PV of free cash flow",
     ]})
     for r in pr:
         t = r["t"]
         df_ = 1 / (1 + a["wacc"]) ** t
-        nopat = r["ebit"] * (1 - a["tax"])
+        nopat = r["nopat"]
         cf[f"Year {t}"] = [
             _money(r["rev"]),
             f"{r['g']*100:+.1f}%",
             _money(r["ebit"]),
             _money(nopat),
             _money(r["da"]),
-            f"({_money(r['capex'])})",
-            f"({_money(r['nwc'])})",
+            _money(-r['capex']),
+            _money(-r['nwc']),
             _money(r["fcf"]),
             f"{df_:.3f}",
             _money(r["fcf"] * df_),
@@ -2565,26 +2406,26 @@ A narrow range = robust thesis; a wild range = fragile.
         rows, pes, evs = [], [], []
         for sym in all_syms:
             b = fetch_valuation_base(sym)
-            if not b:
+            if not b or _dcf_missing_inputs(b):
                 continue
             eps = b["ni"] / b["shares"] if b["shares"] else float("nan")
-            ebitda = b["rev"] * (b["margin"] + DCF_DEFAULTS["da"])
+            ebitda = b["rev"] * (b["margin"] + b["da"])
             mc = b["price"] * b["shares"]
             ev = mc + b["debt"] - b["cash"]
             pe = (mc / b["ni"]) if b["ni"] else float("nan")
             evb = (ev / ebitda) if ebitda else float("nan")
             rows.append({"Ticker": sym, "Name": b["name"], "Price": b["price"],
                          "P/E": pe, "EV/EBITDA": evb, "Yr-1 growth": b["g1"] * 100})
-            if pe == pe and pe > 0:
+            if sym != chosen and pe == pe and pe > 0:
                 pes.append(pe)
-            if evb == evb and evb > 0:
+            if sym != chosen and evb == evb and evb > 0:
                 evs.append(evb)
         if rows:
             import statistics
             med_pe = statistics.median(pes) if pes else float("nan")
             med_ev = statistics.median(evs) if evs else float("nan")
             eps0 = base["ni"] / base["shares"] if base["shares"] else float("nan")
-            ebitda0 = base["rev"] * (base["margin"] + DCF_DEFAULTS["da"])
+            ebitda0 = base["rev"] * (base["margin"] + base["da"])
             pe_price = med_pe * eps0 if (med_pe == med_pe and eps0 == eps0) else float("nan")
             ev_price = ((med_ev * ebitda0) - (base["debt"] - base["cash"])) / base["shares"] \
                 if (med_ev == med_ev and base["shares"]) else float("nan")
@@ -3598,7 +3439,7 @@ Here's what the key numbers mean.
 
 #### 🏆 Best Buy Leaderboard
 A composite **0–100 score** blending momentum, forecast upside, analyst upside, Sharpe ratio, valuation, and RSI.
-Higher = stronger buy case. Use the **quick-sort presets** (Top 1Y Gainers, Hot 3M…) or click any column header.
+Higher = stronger market signals, not proven business value. Buy labels require financial data. Use the **quick-sort presets** or click any column header.
 
 #### ⚠️ Risk metrics (what good looks like)
 | Metric | Plain meaning | Rule of thumb |
@@ -3909,7 +3750,8 @@ if holdings:
 st.subheader("🏆 Best Buy Leaderboard")
 st.caption(
     "Composite score (0–100) blending 3M momentum, 30-day forecast upside, analyst upside, "
-    "Sharpe ratio, valuation, and RSI extremes. Higher = stronger buy case."
+    "Sharpe ratio, P/E, and RSI. This is not a business valuation. "
+    "Buy labels are withheld when core financial data is missing."
 )
 st.caption("💡 Use a quick-sort preset below, or click any column header to sort manually.")
 
