@@ -25,7 +25,7 @@ class IdeaTests(unittest.TestCase):
         f=self.fact()
         self.assertTrue(f['eligible'])
         for profile in PROFILES:
-            self.assertEqual(profile_reasons(f,profile),[])
+            self.assertEqual(profile_reasons(dict(f,drawdown=.35),profile),[])
     def test_empty_provider_never_generates_idea(self):
         f=evaluate(dict(symbol='X'),None,asof='2026-10-21')
         for profile in PROFILES:
@@ -55,6 +55,9 @@ class IdeaTests(unittest.TestCase):
         self.assertTrue(profile_reasons(dict(self.fact(),profit=-1.),'Conservative'))
     def test_conservative_requires_three_profitable_years(self):
         self.assertTrue(profile_reasons(dict(self.fact(),stable_profit=False),'Conservative'))
+    def test_conservative_excludes_high_volatility_and_deep_drawdown(self):
+        self.assertTrue(profile_reasons(dict(self.fact(),drawdown=.35,volatility=.60),'Conservative'))
+        self.assertTrue(profile_reasons(dict(self.fact(),drawdown=.80,volatility=.20),'Conservative'))
     def test_no_fabricated_slots(self):
         self.assertEqual(len(shortlist([self.fact()],'Balanced')),1)
     def test_top_five_are_ranked_not_first_five(self):

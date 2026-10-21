@@ -16,6 +16,9 @@ UNIVERSE = {
     'GM':'General Motors', 'F':'Ford', 'FSLR':'First Solar', 'NVAX':'Novavax',
     'TDOC':'Teladoc', 'XOM':'Exxon Mobil', 'CVX':'Chevron', 'UNH':'UnitedHealth',
     'PG':'Procter & Gamble', 'KO':'Coca-Cola', 'NFLX':'Netflix',
+    'WMT':'Walmart', 'COST':'Costco', 'PEP':'PepsiCo', 'MDLZ':'Mondelez',
+    'MCD':"McDonald’s", 'CL':'Colgate-Palmolive', 'ABT':'Abbott', 'ABBV':'AbbVie',
+    'AMGN':'Amgen', 'GILD':'Gilead', 'HON':'Honeywell', 'LMT':'Lockheed Martin',
 }
 PROFILES = ['Balanced', 'Conservative', 'Higher-risk Recovery']
 
@@ -98,6 +101,8 @@ def evaluate(snapshot, history, asof=None):
     fcfyield = fcf/cap if number(cap) and cap>0 else None
     earningsyield = profit/cap if number(cap) and cap>0 else None
     drawdown = 1-price/prices.max() if len(prices) and number(price) and prices.max()>0 else None
+    returns=prices.tail(253).pct_change().dropna()
+    volatility=float(returns.std()*math.sqrt(252)) if len(returns)>=200 else None
     ni_history = rows['Net income'].loc[:date]
     stable_profit = len(ni_history)>=3 and all(v>0 for v in ni_history.tail(3))
     qprofit = float(qni.iloc[-1]) if len(qni) and len(qrev) and qni.index[-1]==qrev.index[-1] else None
@@ -113,7 +118,7 @@ def evaluate(snapshot, history, asof=None):
                 price=price, currency=quote_currency, financial_currency=currency, revenue=revenue, profit=profit,
                 fcf=fcf, ocf=ocf, growth=annual_growth, qgrowth=qgrowth, opmargin=opmargin, netmargin=netmargin,
                 fcfmargin=fcfmargin, fcfyield=fcfyield, earningsyield=earningsyield, leverage=leverage,
-                cash_years=cash_years, drawdown=drawdown, stable_profit=stable_profit, qprofit=qprofit,
+                cash_years=cash_years, drawdown=drawdown, volatility=volatility, stable_profit=stable_profit, qprofit=qprofit,
                 improving=bool(fcf_improving or loss_improving or (number(qgrowth) and qgrowth>0)), score=score,
                 balance_date=balance_date, balance_age=(now-pd.Timestamp(balance_date)).days if balance_date else None,
                 base=snapshot.get('base'))
@@ -138,6 +143,10 @@ def profile_reasons(fact, profile):
             failures.append('Net debt is too high relative to free cash flow')
         if profile=='Conservative' and not fact['stable_profit']:
             failures.append('Three consecutive profitable annual periods required')
+        if profile=='Conservative' and (not number(fact['volatility']) or fact['volatility']>.30):
+            failures.append('Annualised price volatility exceeds 30% or has insufficient history')
+        if profile=='Conservative' and fact['drawdown']>.40:
+            failures.append('Price is more than 40% below its available five-year high')
     else:
         if not number(fact['drawdown']) or fact['drawdown']<.30:
             failures.append('Price is less than 30% below its available five-year high')
@@ -177,10 +186,10 @@ def entry_range(fact):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_snapshots(_fetch_snapshot):
+def load_snapshots(symbols, _fetch_snapshot):
     output=[]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures={pool.submit(_fetch_snapshot,s):s for s in UNIVERSE}
+        futures={pool.submit(_fetch_snapshot,s):s for s in symbols}
         for future in as_completed(futures):
             symbol=futures[future]
             try:
@@ -198,7 +207,7 @@ def render_stock_ideas(fetch_snapshot,fetch_history):
         st.cache_data.clear()
         st.rerun()
     with st.spinner(f'Screening {len(UNIVERSE)} companies — the first scan may take a minute…'):
-        snapshots=load_snapshots(fetch_snapshot)
+        snapshots=load_snapshots(tuple(UNIVERSE),fetch_snapshot)
         history=fetch_history(tuple(UNIVERSE),period='5y')
         facts=[evaluate(s,history[s['symbol']] if s['symbol'] in history else None) for s in snapshots]
     st.caption(f"Screen run: {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC · {sum(f.get('eligible',False) for f in facts)}/{len(UNIVERSE)} companies have sufficient verified data. Rankings can overlap across styles. This is a limited universe, not the entire US market.")
@@ -214,7 +223,7 @@ def render_stock_ideas(fetch_snapshot,fetch_history):
                     entry=f'{zone[0]:,.2f}–{zone[1]:,.2f}' if zone else 'Needs further valuation'
                     status='Valuation pending' if not zone else 'At/below entry range' if f['price']<=zone[1] else 'Wait for a lower price'
                     why=f"FCF yield {f['fcfyield']:.1%}; annual sales {f['growth']:+.1%}; latest-quarter sales {f['qgrowth']:+.1%}"
-                    risk=('Recovery may fail; cash-burn coverage is only a rough annualised estimate.' if profile=='Higher-risk Recovery' else
+                    risk=(('Cash burn and refinancing can undermine a recovery.' if f['fcf']<=0 else 'The large drawdown may reflect lasting business damage; review its cause.') if profile=='Higher-risk Recovery' else
                           'Sales are slowing; verify the next earnings report.' if f['qgrowth']<f['growth'] else
                           'Valuation depends on future cash generation; results can disappoint.')
                     table.append({'Rank':rank,'Stock':f"{f['symbol']} · {f['name']}",'Price':f"{f['price']:,.2f} {f['currency']}",
@@ -226,6 +235,8 @@ def render_stock_ideas(fetch_snapshot,fetch_history):
                         st.write(f"Annual operating margin {f['opmargin']:.1%}; FCF margin {f['fcfmargin']:.1%}; net debt / FCF {f['leverage']:.1f}×." if number(f['leverage']) else f"Annual FCF margin {f['fcfmargin']:.1%}; cash / annual cash burn {f['cash_years']:.1f} years.")
                         st.write(note)
                         st.caption(f"Annual period: {f['date']} · latest quarter: {f['quarter']} · balance sheet: {f['balance_date']} · drawdown from available five-year high: {f['drawdown']:.1%}. Qualitative catalysts and one-off earnings require review.")
+                        if number(f['volatility']):
+                            st.caption(f"Trailing annualised price volatility: {f['volatility']:.1%}. Entry scenarios hold the latest annual operating margin and investment ratios constant; unusually high or low investment can distort the range.")
                         st.markdown(f"[Financial statements](https://finance.yahoo.com/quote/{f['symbol']}/financials/) · [SEC filings](https://www.sec.gov/edgar/browse/?CIK={f['symbol']}&owner=exclude)")
     with st.expander('Why NVAX / PayPal / TDOC did or did not qualify'):
         for symbol in ['NVAX','PYPL','TDOC']:
@@ -237,5 +248,5 @@ def render_stock_ideas(fetch_snapshot,fetch_history):
                     st.write(f"{profile}: " + ('Meets the screen; ranking determines whether it reaches the top five.' if not reasons else '; '.join(reasons)))
     with st.expander('Screening rules and full coverage'):
         st.write('Score weights: free-cash-flow yield 25%, earnings yield 15%, annual sales growth 20%, FCF margin 15%, operating margin 10%, net-debt coverage 15%. Recovery adds a drawdown component after improvement/liquidity checks. Scores are heuristics, not probabilities of profit.')
-        st.write('Conservative requires three profitable annual periods, non-declining annual and quarterly sales, positive cash flow, and net debt no greater than three years of FCF. Balanced allows small sales declines and up to six years of net debt/FCF. Recovery requires a ≥30% drawdown and operating improvement, plus positive FCF or two years of cash-burn coverage.')
+        st.write('Conservative requires three profitable annual periods, non-declining annual and quarterly sales, positive cash flow, net debt no greater than three years of FCF, annualised price volatility ≤30%, and a drawdown ≤40%. Balanced allows small sales declines and up to six years of net debt/FCF. Recovery requires a ≥30% drawdown and operating improvement, plus positive FCF or two years of cash-burn coverage.')
         st.dataframe(pd.DataFrame([{'Ticker':f['symbol'],'Data status':'Complete' if f.get('eligible') else '; '.join(f['issues'])} for f in sorted(facts,key=lambda x:x['symbol'])]),hide_index=True,use_container_width=True)

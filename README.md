@@ -51,7 +51,7 @@ Then open http://localhost:8501
 
 ## Top 5 Buy Ideas
 
-The new page screens a disclosed 32-company US universe and shows up to five ideas
+The new page screens a disclosed 44-company US universe and shows up to five ideas
 for each of Balanced, Conservative and Higher-risk Recovery. It refreshes public
 financial snapshots every 30 minutes, checks recent quarterly sales, verifies
 reporting currency, and dates the annual accounts and balance sheet. It does not

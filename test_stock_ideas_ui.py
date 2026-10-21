@@ -17,7 +17,7 @@ original_evaluate=stock_ideas.evaluate
 stock_ideas.UNIVERSE=dict(list(stock_ideas.UNIVERSE.items())[:6])
 stock_ideas.evaluate=lambda s,h: original_evaluate(s,h,asof='2026-10-21')
 def fetch(s): return snapshot(s)
-def history(symbols,period): return pd.DataFrame({{s:prices() for s in symbols}})
+def history(symbols,period): return pd.DataFrame({{s:prices()*.5+5 for s in symbols}})
 try:
     stock_ideas.render_stock_ideas(fetch,history)
 finally:
