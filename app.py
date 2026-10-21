@@ -33,25 +33,20 @@ from plotly.subplots import make_subplots
 from sklearn.linear_model import LinearRegression
 
 import auth
+from fundamentals import enrich_info, annual_rows, series as statement_series
+from comparison import render_comparison
 from valuation import (DCF_DEFAULTS, _finite, _first_finite, _annual_calibration,
                        _dcf_missing_inputs, _dcf_project, _dcf, _dcf_price_gm,
                        _dcf_price_w, _capm_wacc, _implied_growth, _health_verdict)
 from tickers import MARKET_PRESETS, NASDAQ_TRADER_SOURCES, WIKIPEDIA_INDEX_SOURCES
 
-STORAGE_PATH = Path(__file__).parent / "user_state.json"
-
-
 def load_storage() -> dict:
-    if not STORAGE_PATH.exists():
-        return {"portfolio": [], "alerts": []}
-    try:
-        return json.loads(STORAGE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"portfolio": [], "alerts": []}
+    # A shared password is not a user identity. Never read another visitor's file.
+    return {"portfolio": [], "alerts": []}
 
 
 def save_storage(data: dict) -> None:
-    STORAGE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    st.session_state.user_state = data
 
 # Optional: statsmodels for a slightly nicer forecast — fall back gracefully.
 try:
@@ -195,12 +190,29 @@ def _fetch_info_cached(ticker: str) -> dict:
     raise RuntimeError("empty info payload (throttled)")  # not cached
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_info(ticker: str) -> dict:
-    """Public, safe accessor — returns {} on a throttled/empty fetch (uncached)."""
+    """Enrich a partial/failed summary feed from independent reported statements."""
     try:
-        return _fetch_info_cached(ticker)
+        info = _fetch_info_cached(ticker)
     except Exception:
-        return {}
+        info = {}
+    fast = {}
+    if not info.get("currentPrice") or not info.get("currency") or not info.get("sharesOutstanding"):
+        try:
+            fi = yf.Ticker(ticker).fast_info
+            for dest, key in [("currentPrice","last_price"), ("sharesOutstanding","shares"), ("currency","currency")]:
+                try:
+                    fast[dest] = fi[key]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    try:
+        fin = fetch_financial_statements(ticker)
+    except Exception:
+        fin = {}
+    return enrich_info(info, fin, fast)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -512,9 +524,9 @@ class StockMetrics:
     risk_level: str            # Low / Medium / High / Very High
     best_buy_score: float      # 0-100 composite
     recommendation: str        # Strong Buy / Buy / Hold / Reduce / Sell
-    annual_revenue: float | None       # TTM total revenue
+    annual_revenue: float | None       # Reported annual or trailing revenue
     revenue_yoy: float | None          # YoY revenue growth (decimal)
-    net_income: float | None           # TTM net income
+    net_income: float | None           # Reported annual or trailing net income
     earnings_yoy: float | None         # YoY earnings growth (decimal)
     sales_growth_qoq: float | None     # Most-recent quarter revenue growth (decimal)
     market_cap: float | None           # USD market capitalization
@@ -684,15 +696,15 @@ def _best_buy_score(m: dict) -> tuple[float, str]:
     score = float(np.clip(score, 0, 100))
 
     if score >= 75:
-        rec = "Strong Buy"
+        rec = "Very strong signal"
     elif score >= 60:
-        rec = "Buy"
+        rec = "Strong signal"
     elif score >= 45:
-        rec = "Hold"
+        rec = "Neutral signal"
     elif score >= 30:
-        rec = "Reduce"
+        rec = "Weak signal"
     else:
-        rec = "Sell"
+        rec = "Very weak signal"
     return score, rec
 
 
@@ -811,7 +823,7 @@ def compute_metrics(
 
     # Financial KPIs from the info dict — already fetched, so no extra HTTP call.
     annual_rev = info.get("totalRevenue")
-    rev_yoy = info.get("revenueGrowth")  # TTM YoY (decimal, e.g. 0.12 = +12%)
+    rev_yoy = info.get("revenueGrowth")  # Reported YoY (decimal, e.g. 0.12 = +12%)
     net_inc = _first_finite(info.get("netIncomeToCommon"), info.get("netIncome"))
     # earningsGrowth is often null for loss-making firms; fall back to the
     # quarterly YoY earnings growth when available.
@@ -863,17 +875,31 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_statements(ticker: str) -> dict:
+def _fetch_statements_cached(ticker: str) -> dict:
     """Income statement / balance sheet / cash flow for the detail dialog."""
+    t = yf.Ticker(ticker)
+    result = {}
+    # One failed endpoint must not discard two successful statement responses.
+    for key, attr in [("income", "income_stmt"), ("balance", "balance_sheet"), ("cashflow", "cashflow")]:
+        try:
+            frame = getattr(t, attr)
+            if frame is not None and not frame.empty:
+                result[key] = frame
+        except Exception:
+            pass
+    if not result:
+        raise RuntimeError("Financial statements temporarily unavailable; retry.")
+    return result
+
+
+def fetch_financial_statements(ticker: str) -> dict:
     try:
-        t = yf.Ticker(ticker)
-        return {
-            "income": t.income_stmt,
-            "balance": t.balance_sheet,
-            "cashflow": t.cashflow,
-        }
+        return _fetch_statements_cached(ticker)
     except Exception:
         return {}
+
+
+fetch_financial_statements.clear = _fetch_statements_cached.clear
 
 
 def _money(value) -> str:
@@ -1533,7 +1559,13 @@ def fetch_valuation_base(ticker: str) -> dict | None:
                     break
             except Exception:
                 pass
+    try:
+        info = dict(fetch_info(ticker), **{k: v for k, v in info.items() if v is not None})
+    except Exception:
+        pass
     ni = _first_finite(info.get("netIncomeToCommon"), info.get("netIncome"))
+    shares = _first_finite(shares, info.get("sharesOutstanding"))
+    currency = currency or info.get("currency")
     return {
         "name": info.get("shortName") or info.get("longName") or ticker,
         "price": price, "shares": shares,
@@ -1545,7 +1577,7 @@ def fetch_valuation_base(ticker: str) -> dict | None:
         "da": calibration.get("da"), "capex": calibration.get("capex"),
         "calibration_period": calibration.get("calibration_period"),
         "currency": currency, "financial_currency": info.get("financialCurrency"),
-        "pe": info.get("trailingPE"), "ev_ebitda": info.get("enterpriseToEbitda"),
+        "pe": _first_finite(info.get("trailingPE"), info.get("annualPE")), "ev_ebitda": info.get("enterpriseToEbitda"),
         "sector": info.get("sector") or "—", "beta": _first_finite(info.get("beta")),
     }
 
@@ -1609,7 +1641,7 @@ _AN_SCORE = {"good": 2, "okay": 1, "bad": 0}
 
 
 def _an_rate(value, good, okay, lower_better=False) -> str:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if not _finite(value):
         return "na"
     if lower_better:
         if value <= good:
@@ -1645,7 +1677,9 @@ def fetch_analyzer_data(ticker: str) -> dict | None:
         "industry": info.get("industry") or "",
         "summary": info.get("longBusinessSummary") or "",
         "price": price,
-        "currency": info.get("currency") or "USD",
+        "currency": info.get("currency") or "Unknown",
+        "data_period": info.get("_statement_period"),
+        "derived_fields": info.get("_derived_fields", []),
         "revenue_growth": info.get("revenueGrowth"),
         "gross_margin": info.get("grossMargins"),
         "net_margin": info.get("profitMargins"),
@@ -1655,8 +1689,8 @@ def fetch_analyzer_data(ticker: str) -> dict | None:
         "current_ratio": info.get("currentRatio"),
         "operating_cf": info.get("operatingCashflow"),
         "fcf": info.get("freeCashflow"),
-        "net_income": info.get("netIncomeToCommon") or info.get("netIncome"),
-        "pe": info.get("trailingPE"),
+        "net_income": _first_finite(info.get("netIncomeToCommon"), info.get("netIncome")),
+        "pe": _first_finite(info.get("trailingPE"), info.get("annualPE")),
         "peg": info.get("trailingPegRatio") or info.get("pegRatio"),
         "pb": info.get("priceToBook"),
         "ev_ebitda": info.get("enterpriseToEbitda"),
@@ -1670,22 +1704,13 @@ def fetch_analyzer_data(ticker: str) -> dict | None:
         fin = fetch_financial_statements(ticker)
         inc, cfs = fin.get("income"), fin.get("cashflow")
 
-        def _series(df, *names):
-            if df is None or getattr(df, "empty", True):
-                return []
-            for nm in names:
-                if nm in df.index:
-                    return [float(x) for x in df.loc[nm].values if x == x][::-1]
-            return []
+        history = annual_rows(fin)
+        rev_s, ni_s, fcf_s = history["Revenue"], history["Net income"], history["Free cash flow"]
+        paired = rev_s.index.intersection(ni_s.index)
+        rev_series = rev_s.reindex(paired).tolist()
+        ni_series = ni_s.reindex(paired).tolist()
+        fcf_series = fcf_s.tolist()
 
-        rev_series = _series(inc, "Total Revenue", "Operating Revenue")
-        ni_series = _series(inc, "Net Income", "Net Income Common Stockholders")
-        fcf_series = _series(cfs, "Free Cash Flow")
-        if not fcf_series:
-            ocf = _series(cfs, "Operating Cash Flow", "Total Cash From Operating Activities")
-            capex = _series(cfs, "Capital Expenditure")
-            if ocf and capex and len(ocf) == len(capex):
-                fcf_series = [o + c for o, c in zip(ocf, capex)]  # capex is negative
     except Exception:
         pass
     d["rev_series"], d["ni_series"], d["fcf_series"] = rev_series, ni_series, fcf_series
@@ -1730,7 +1755,7 @@ def _analyzer_rows(d: dict) -> dict:
     cr = d["current_ratio"]
     rows["Balance Sheet"] = [
         row("Debt-to-equity", de, f"{de:.2f}" if de is not None else "N/A",
-            _an_rate(de, *ANALYZER_TH["debt_to_equity"], lower_better=True),
+            _an_rate(de if de is not None and de >= 0 else None, *ANALYZER_TH["debt_to_equity"], lower_better=True),
             f"It owes about ${de:.2f} of debt for every $1 the owners have invested." if de is not None else "Not reported.",
             "Too much debt is dangerous in a bad year; a lower ratio means a sturdier company."),
         row("Current ratio", cr, f"{cr:.2f}" if cr is not None else "N/A",
@@ -1771,14 +1796,14 @@ def _analyzer_rows(d: dict) -> dict:
     # ---- Valuation ----
     pe = d["pe"]
     peg = d["peg"]
-    pe_rating = "bad" if (pe is not None and pe < 0) else _an_rate(pe, *ANALYZER_TH["pe"], lower_better=True)
+    pe_rating = "na" if (pe is not None and pe <= 0) else _an_rate(pe, *ANALYZER_TH["pe"], lower_better=True)
     rows["Valuation"] = [
         row("P/E ratio", pe, f"{pe:.1f}" if pe is not None else "N/A", pe_rating,
             (f"You pay about ${pe:.1f} for every $1 of yearly profit." if (pe or 0) > 0 else
              "The company isn't profitable on a trailing basis, so P/E doesn't apply.") if pe is not None else "Not reported.",
             "A high P/E means high expectations — the company must keep growing to justify it. Always compare to peers."),
         row("PEG ratio", peg, f"{peg:.2f}" if peg is not None else "N/A",
-            _an_rate(peg, *ANALYZER_TH["peg"], lower_better=True),
+            _an_rate(peg if peg is not None and peg > 0 else None, *ANALYZER_TH["peg"], lower_better=True),
             f"P/E adjusted for growth is about {peg:.2f}." if peg is not None else "Not reported.",
             "Around 1 is often fair for the growth; well above 2 may be pricey."),
         # Extra context rows (not rated — shown as info)
@@ -1899,13 +1924,24 @@ def render_analyzer_body(chosen: str) -> None:
             st.rerun()
         return
 
+    if d.get("derived_fields"):
+        st.caption(f"Statement fallback: annual financials ending {d.get('data_period') or 'unknown date'}. See Compare Stocks for consistently dated P&L and cash flow.")
+    if st.button("Refresh company data", key=f"an_retry_{chosen}"):
+        fetch_info.clear()
+        fetch_financial_statements.clear()
+        fetch_analyzer_data.clear()
+        fetch_valuation_base.clear()
+        st.rerun()
     sections = _analyzer_rows(d)
 
     # ---- Category scores (aggregate of rated metrics) ----
     cat_rating = {}
     for cat, rws in sections.items():
         scored = [_AN_SCORE[r["rating"]] for r in rws if r["rating"] in _AN_SCORE]
-        if len(scored) < math.ceil(len(rws) / 2):
+        # Context-only P/B, EV/EBITDA and qualitative moat rows are not scored.
+        eligible = {"Profitability": 4, "Balance Sheet": 2, "Cash Flow": 2,
+                    "Valuation": 2, "Quality": 2}[cat]
+        if len(scored) < math.ceil(eligible / 2):
             cat_rating[cat] = "na"
         else:
             avg = sum(scored) / len(scored)
@@ -2100,6 +2136,11 @@ A narrow range = robust thesis; a wild range = fragile.
             st.rerun()
         return
 
+    if base and not base.get("financial_currency"):
+        st.warning("The financial-statement currency was not reported. Confirm it before comparing financial amounts with the quote.")
+        if not st.checkbox(f"I verified the statements are in {base.get('currency') or 'the quote currency'}", key=f"val_currency_{chosen}"):
+            return
+        base = dict(base, financial_currency=base.get("currency"))
     missing = _dcf_missing_inputs(base)
     if missing:
         st.warning("DCF unavailable. Missing or incompatible inputs: " + ", ".join(missing) + ". No valuation or buy signal is generated.")
@@ -2176,6 +2217,9 @@ A narrow range = robust thesis; a wild range = fragile.
     if D["error"]:
         st.warning("DCF unavailable: " + D["error"])
         return
+    if D["ps"] <= 0:
+        st.warning("This scenario leaves no positive value for shareholders after debt. No entry price is generated.")
+        return
     if D["tvShare"] > 0.75:
         st.caption(f"{D['tvShare']:.0%} of enterprise value comes from cash flows after year five. Review the sensitivity range.")
 
@@ -2230,14 +2274,14 @@ A narrow range = robust thesis; a wild range = fragile.
         )
         gc1, gc2 = st.columns([2, 1])
         gc1.plotly_chart(gauge, use_container_width=True)
-        zone = "undervalued 🟢" if base["price"] < fair else "overvalued 🔴"
+        zone = "below model value" if base["price"] < fair else "above model value"
         gc2.markdown(
             f'<div class="gt-card" style="height:100%;display:flex;flex-direction:column;justify-content:center;">'
             f'<div style="font-size:0.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em;">Verdict</div>'
-            f'<div style="font-size:1.3rem;font-weight:700;color:#f3f4f6;margin:6px 0;">DCF says <span style="color:{up_color};">{zone}</span></div>'
+            f'<div style="font-size:1.3rem;font-weight:700;color:#f3f4f6;margin:6px 0;">Price is <span style="color:{up_color};">{zone}</span></div>'
             f'<div style="font-size:0.8rem;color:#cbd5e1;">Fair value <b>{fair:,.2f}</b> vs price <b>{base["price"]:,.2f}</b></div>'
             f'<div style="font-size:0.8rem;color:{up_color};font-weight:600;margin-top:4px;">{_fmt_pct(upside)} {"upside" if upside>=0 else "downside"}</div>'
-            f'<div style="font-size:0.66rem;color:#64748b;margin-top:8px;">White line = fair value · green zone = undervalued · red zone = overvalued</div>'
+            f'<div style="font-size:0.66rem;color:#64748b;margin-top:8px;">Scenario estimate, not a guaranteed price target</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -2260,10 +2304,10 @@ A narrow range = robust thesis; a wild range = fragile.
     if gap is None:
         verdict_txt, verdict_color = "—", "#9ca3af"
     elif gap > 0.02:
-        verdict_txt = "Market expects MORE growth than the selected assumptions — priced for optimism"
+        verdict_txt = "Matching today’s price requires higher growth in this scenario"
         verdict_color = "#f59e0b"
     elif gap < -0.02:
-        verdict_txt = "Market expects LESS growth than the selected assumptions — priced conservatively"
+        verdict_txt = "Matching today’s price requires lower growth in this scenario"
         verdict_color = "#10b981"
     else:
         verdict_txt = "Market expectations roughly match the selected growth assumption"
@@ -2381,9 +2425,9 @@ A narrow range = robust thesis; a wild range = fragile.
         st.plotly_chart(wf, use_container_width=True)
         ps_txt = f"{D['ps']:,.2f}" if D["ps"] == D["ps"] else "—"
         st.caption(
-            f"5 years of discounted cash + terminal value = **{_money(D['ev'])}** enterprise value. "
-            f"Subtract net debt of **{_money(D['netDebt'])}** → **{_money(D['eq'])}** equity value, "
-            f"÷ {base['shares']/1e6:,.0f}M shares = **{ps_txt}** per share."
+            f"5 years of discounted cash + terminal value = {_money(D['ev']).replace(chr(36), chr(92)+chr(36))} enterprise value. "
+            f"Subtract net debt of {_money(D['netDebt']).replace(chr(36), chr(92)+chr(36))} → {_money(D['eq']).replace(chr(36), chr(92)+chr(36))} equity value, "
+            f"÷ {base['shares']/1e6:,.0f}M shares = {ps_txt} per share."
         )
 
     # --- Sensitivity heatmaps -------------------------------------------
@@ -2832,7 +2876,7 @@ def _fmt_num(x: float, decimals: int = 2) -> str:
 
 
 def _color(value: float) -> str:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if not _finite(value):
         return "#9ca3af"
     return "#16a34a" if value >= 0 else "#dc2626"
 
@@ -3192,7 +3236,7 @@ if _auth_on:
 
 # Page selector — tab-style. Markets page renders + st.stop()s so the existing
 # stock pipeline below only executes when on the Stocks view.
-_views = ["📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer"]
+_views = ["⚖️ Compare Stocks", "📈 Global Stocks", "🚀 Top Movers", "🔬 Stock Analyzer"]
 if _is_admin:
     _views.append("🛡️ Admin")
 _active_view = st.radio(
@@ -3202,6 +3246,9 @@ _active_view = st.radio(
     label_visibility="collapsed",
     key="active_view",
 )
+if _active_view == "⚖️ Compare Stocks":
+    render_comparison(fetch_info, fetch_financial_statements, fetch_valuation_base)
+    st.stop()
 if _active_view == "🚀 Top Movers":
     render_top_movers()
     st.stop()
@@ -3339,7 +3386,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("💼 My Portfolio", expanded=False):
-        st.caption("Holdings persist between sessions in `user_state.json`.")
+        st.caption("Private to this browser session. Holdings are not saved after this session ends.")
         with st.form("add_holding", clear_on_submit=True):
             h_ticker = st.text_input("Ticker", placeholder="AAPL").strip().upper()
             h_qty = st.number_input("Quantity", min_value=0.0, value=0.0, step=1.0)
@@ -3361,6 +3408,7 @@ with st.sidebar:
                     st.rerun()
 
     with st.expander("🔔 Price Alerts", expanded=False):
+        st.caption("Private to this session. Alerts are checked only while this page runs.")
         with st.form("add_alert", clear_on_submit=True):
             a_ticker = st.text_input("Ticker for alert", placeholder="AAPL").strip().upper()
             a_op = st.selectbox("Condition", ["above", "below"])
@@ -3432,14 +3480,14 @@ Here's what the key numbers mean.
 | **% today** | Price change so far today |
 | **Period change** (toggle 3M–5Y) | Total price return over the chosen window |
 | **Risk pill** | Low → Very High, from volatility + worst drawdown |
-| **Signal pill** | Best-Buy read: Strong Buy → Sell |
+| **Signal pill** | Historical market signal: very strong → very weak; not a trade recommendation |
 | **Revenue / Net Income + YoY** | Company scale and whether it's growing |
 | **3Y CAGR** | Annualized price growth over 3 years |
 | **Trend sparkline** | Mini price chart for the selected period |
 
-#### 🏆 Best Buy Leaderboard
+#### 🏆 Market Signal Leaderboard
 A composite **0–100 score** blending momentum, forecast upside, analyst upside, Sharpe ratio, valuation, and RSI.
-Higher = stronger market signals, not proven business value. Buy labels require financial data. Use the **quick-sort presets** or click any column header.
+Higher = stronger market signals, not proven business value. Use the **quick-sort presets** or click any column header.
 
 #### ⚠️ Risk metrics (what good looks like)
 | Metric | Plain meaning | Rule of thumb |
@@ -3505,7 +3553,7 @@ if not all_metrics:
 
 def _growth_line(label: str, value: float | None) -> str:
     """Compact "Label · +12.3%" row, color-coded green/red."""
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if not _finite(value):
         return (
             f"<div style='display:flex;justify-content:space-between;font-size:0.7rem;color:#94a3b8;'>"
             f"<span>{label}</span><span>—</span></div>"
@@ -3601,7 +3649,7 @@ def live_quote_tiles() -> None:
                 )
 
                 right_html = (
-                    '<div style="font-size:0.66rem;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Revenue (TTM)</div>'
+                    '<div style="font-size:0.66rem;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Reported revenue</div>'
                     f'<div style="font-size:0.95rem;font-weight:600;color:#f3f4f6;line-height:1.1;">{_money(m.annual_revenue)}</div>'
                     f"{_growth_line('YoY growth', m.revenue_yoy)}"
                     '<div style="font-size:0.66rem;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-top:10px;margin-bottom:4px;">Net Income</div>'
@@ -3746,25 +3794,25 @@ if holdings:
     st.divider()
 
 
-# ---- Best Buy Leaderboard -----------------------------------------------
-st.subheader("🏆 Best Buy Leaderboard")
+# ---- Market Signal Leaderboard -----------------------------------------------
+st.subheader("🏆 Market Signal Leaderboard")
 st.caption(
     "Composite score (0–100) blending 3M momentum, 30-day forecast upside, analyst upside, "
     "Sharpe ratio, P/E, and RSI. This is not a business valuation. "
-    "Buy labels are withheld when core financial data is missing."
+    "Signals describe price behaviour, not a recommendation to trade. Missing financial data is flagged."
 )
 st.caption("💡 Use a quick-sort preset below, or click any column header to sort manually.")
 
 # Sort presets — one-click reordering. (col, ascending)
 _LB_SORT_PRESETS = {
-    "🏆 Highest Score": ("Best Buy Score", False),
+    "🏆 Highest Score": ("Signal Score", False),
     "📈 Top 1Y Gainers": ("1Y %", False),
     "📉 Top 1Y Losers": ("1Y %", True),
     "🔥 Hot 3M": ("3M %", False),
     "🎯 Best Forecast": ("Forecast 30d %", False),
 }
 if "_lb_sort" not in st.session_state:
-    st.session_state["_lb_sort"] = ("Best Buy Score", False)
+    st.session_state["_lb_sort"] = ("Signal Score", False)
 
 _preset_cols = st.columns(len(_LB_SORT_PRESETS))
 for _col, (_label, _cfg) in zip(_preset_cols, _LB_SORT_PRESETS.items()):
@@ -3797,7 +3845,7 @@ leaderboard = pd.DataFrame(
             "Ticker": m.ticker,
             "Name": m.name,
             "Price": m.price,
-            "Best Buy Score": m.best_buy_score,
+            "Signal Score": m.best_buy_score,
             "Recommendation": m.recommendation,
             "Risk": m.risk_level,
             "1Y Trend": _trend_series(m.ticker),
@@ -3814,7 +3862,7 @@ leaderboard = pd.DataFrame(
 )
 _sort_col, _sort_asc = st.session_state["_lb_sort"]
 if _sort_col not in leaderboard.columns:
-    _sort_col, _sort_asc = "Best Buy Score", False
+    _sort_col, _sort_asc = "Signal Score", False
 leaderboard = leaderboard.sort_values(_sort_col, ascending=_sort_asc, na_position="last")
 st.caption(f"Sorted by **{_sort_col}** ({'ascending' if _sort_asc else 'descending'}).")
 
@@ -3824,7 +3872,7 @@ st.dataframe(
     hide_index=True,
     column_config={
         "Price": st.column_config.NumberColumn(format="%.2f"),
-        "Best Buy Score": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
+        "Signal Score": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
         "1Y Trend": st.column_config.LineChartColumn("1Y Trend", width="small"),
         "3M %": st.column_config.NumberColumn(format="%+.1f"),
         "6M %": st.column_config.NumberColumn(format="%+.1f"),

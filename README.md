@@ -47,3 +47,19 @@ Then open http://localhost:8501
 2. Go to https://share.streamlit.io → **New app**.
 3. Pick this repo, branch `main`, main file `app.py`.
 4. Deploy.
+# October 2026 reliability and comparison update
+
+- Compare Stocks is the landing page, with two companies alongside each other, a
+  four-measure business preference, three fiscal years of P&L and cash flow, YoY
+  growth and downloadable CSV tables. Each company's fiscal dates are visible.
+- Partial summary-feed failures fall back to date-aligned annual statements.
+  Annual cash flows and profits are kept together; missing figures remain blank.
+- Scenario entry levels use a common discount rate and an explicit margin of
+  safety. Missing financial currency requires verification before a target appears.
+- Price-trend scores use signal labels rather than automatic Buy/Sell instructions.
+- Portfolios and alerts are private to the Streamlit session. The former shared
+  server file is no longer read or written; there is no per-person identity in
+  shared-password mode, so persistent private portfolios require a separate store.
+- Run `python -m unittest discover -p "test_*.py"` for valuation, statement fallback,
+  comparison and Streamlit UI checks.
+

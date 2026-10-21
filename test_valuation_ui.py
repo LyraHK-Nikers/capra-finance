@@ -55,6 +55,14 @@ render_valuation_body('TEST')
         self.assertTrue(any('Missing or incompatible' in m.value for m in app.warning))
         self.assertEqual(len(app.metric), 0)
 
+    def test_unknown_statement_currency_requires_verification(self):
+        app = self.app("BASE['financial_currency'] = None\n")
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.metric), 0)
+        app.checkbox(key='val_currency_TEST').check().run()
+        self.assertFalse(app.exception)
+        self.assertGreater(len(app.metric), 0)
+
     def test_missing_beta_uses_explicit_manual_discount_rate(self):
         app = self.app("BASE['beta'] = None\n")
         self.assertFalse(app.exception)
