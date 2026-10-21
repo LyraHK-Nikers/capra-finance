@@ -200,17 +200,17 @@ def load_snapshots(symbols, _fetch_snapshot):
 
 
 def render_stock_ideas(fetch_snapshot,fetch_history):
-    st.subheader('Top 5 Buy Ideas — three investing styles')
-    st.caption('A US-stock research shortlist, refreshed from reported financials and prices. A large price fall or an EPS beat alone is not enough to qualify.')
-    st.write('**Balanced:** profitable businesses at reasonable valuations. **Conservative:** stronger cash generation and balance sheets. **Recovery:** depressed prices with evidence of improvement; substantial loss risk.')
-    if st.button('Refresh stock ideas'):
+    title,refresh=st.columns([5,1])
+    title.subheader('Top 5 Buy Ideas')
+    st.caption('Choose an investing style. Compare the five ideas below; expand a stock for its rationale, risks and price assumptions.')
+    if refresh.button('Refresh ideas'):
         st.cache_data.clear()
         st.rerun()
     with st.spinner(f'Screening {len(UNIVERSE)} companies — the first scan may take a minute…'):
         snapshots=load_snapshots(tuple(UNIVERSE),fetch_snapshot)
         history=fetch_history(tuple(UNIVERSE),period='5y')
         facts=[evaluate(s,history[s['symbol']] if s['symbol'] in history else None) for s in snapshots]
-    st.caption(f"Screen run: {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC · {sum(f.get('eligible',False) for f in facts)}/{len(UNIVERSE)} companies have sufficient verified data. Rankings can overlap across styles. This is a limited universe, not the entire US market.")
+    st.caption(f"Evaluated {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC · {sum(f.get('eligible',False) for f in facts)}/{len(UNIVERSE)} companies have sufficient data · public snapshots cached up to 30 minutes.")
     for tab,profile in zip(st.tabs(PROFILES),PROFILES):
         with tab:
             picks=shortlist(facts,profile)
@@ -247,6 +247,7 @@ def render_stock_ideas(fetch_snapshot,fetch_history):
                     reasons=profile_reasons(f,profile)
                     st.write(f"{profile}: " + ('Meets the screen; ranking determines whether it reaches the top five.' if not reasons else '; '.join(reasons)))
     with st.expander('Screening rules and full coverage'):
+        st.write('Balanced ranks profitable cash generators using value, growth and debt. Conservative adds sustained profits and lower-volatility checks. Recovery looks for depressed prices with evidence of improvement and carries substantial loss risk. Rankings can overlap; this is a limited US universe, not the entire market. A large price fall or an EPS beat alone is not enough to qualify.')
         st.write('Score weights: free-cash-flow yield 25%, earnings yield 15%, annual sales growth 20%, FCF margin 15%, operating margin 10%, net-debt coverage 15%. Recovery adds a drawdown component after improvement/liquidity checks. Scores are heuristics, not probabilities of profit.')
         st.write('Conservative requires three profitable annual periods, non-declining annual and quarterly sales, positive cash flow, net debt no greater than three years of FCF, annualised price volatility ≤30%, and a drawdown ≤40%. Balanced allows small sales declines and up to six years of net debt/FCF. Recovery requires a ≥30% drawdown and operating improvement, plus positive FCF or two years of cash-burn coverage.')
         st.dataframe(pd.DataFrame([{'Ticker':f['symbol'],'Data status':'Complete' if f.get('eligible') else '; '.join(f['issues'])} for f in sorted(facts,key=lambda x:x['symbol'])]),hide_index=True,use_container_width=True)
