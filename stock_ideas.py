@@ -134,17 +134,23 @@ def profile_reasons(fact, profile):
             failures.append('Annual operating profit / net profit is not positive')
         if fact['fcf']<=0 or not number(fact['ocf']) or fact['ocf']<=0:
             failures.append('Positive operating and free cash flow required')
-        if not number(fact['qprofit']) or fact['qprofit']<0:
-            failures.append('Latest reported quarter is loss-making or unavailable')
+        if not number(fact['qprofit']):
+            failures.append('Latest quarterly net income is unavailable')
+        elif fact['qprofit']<0:
+            failures.append('Latest reported quarter is loss-making')
         growth_floor, quarter_floor, debt_limit = ((0.,0.,3.) if profile=='Conservative' else (-.05,-.10,6.))
         if fact['growth']<growth_floor or fact['qgrowth']<quarter_floor:
             failures.append('Annual / quarterly sales trend is below this profile’s limit')
-        if not number(fact['leverage']) or fact['leverage']>debt_limit:
-            failures.append('Net debt is too high relative to free cash flow')
+        if not number(fact['leverage']):
+            failures.append('Positive free cash flow is needed to assess debt coverage')
+        elif fact['leverage']>debt_limit:
+            failures.append(f"Net debt equals {fact['leverage']:.1f} years of FCF, above the {debt_limit:.0f}-year limit")
         if profile=='Conservative' and not fact['stable_profit']:
             failures.append('Three consecutive profitable annual periods required')
-        if profile=='Conservative' and (not number(fact['volatility']) or fact['volatility']>.30):
-            failures.append('Annualised price volatility exceeds 30% or has insufficient history')
+        if profile=='Conservative' and not number(fact['volatility']):
+            failures.append('Insufficient price history to measure volatility')
+        elif profile=='Conservative' and fact['volatility']>.30:
+            failures.append(f"Annualised price volatility is {fact['volatility']:.0%}, above the 30% limit")
         if profile=='Conservative' and fact['drawdown']>.40:
             failures.append('Price is more than 40% below its available five-year high')
     else:
